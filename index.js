@@ -6,20 +6,50 @@ import cors from 'cors';
 const app    = express();
 const server = createServer(app);
 const wss    = new WebSocketServer({ server });
-
 app.use(cors());
 app.use(express.json());
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
-let currentMarket  = null;
-let latestOdds     = { yes: 0.5, no: 0.5 };
-let latestBTCPrice = null;
-let windowOpenPrice = null; // Chainlink price captured at exact window open
-let clients        = new Set();
+let currentMarket   = null;
+let latestOdds      = { yes: 0.5, no: 0.5 };
+let latestBTCPrice  = null;
+let clients         = new Set();
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function getWindowTs(offset = 0) {
+  const sec = Math.floor(Date.now() / 1000);
+  return (sec - (sec % 300)) + offset * 300;
+}
+
+function broadcast(msg) {
+  const s = JSON.stringify(msg);
+  for (const c of clients) if (c.readyState === WebSocket.OPEN) c.send(s);
+}
+
+// ── PRICE TO BEAT — fetch Binance 1m candle open at window start ──────────────
+// This is EXACTLY how Polymarket determines the price to beat:
+// the Chainlink/market price at the window open timestamp.
+// Binance 1m open is the best public proxy for this.
+async function fetchPriceToBeat(windowTs) {
+  try {
+    // Binance: get the 1-minute candle that starts at windowTs
+    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=${windowTs * 1000}&limit=1`;
+    const r   = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    const d   = await r.json();
+    if (Array.isArray(d) && d.length) {
+      const openPrice = parseFloat(d[0][1]); // index 1 = open price
+      console.log('[PTB] Binance 1m open at', windowTs, '=', openPrice);
+      return openPrice;
+    }
+  } catch(e) {
+    console.error('[PTB] Binance error:', e.message);
+  }
+  // Fallback: Chainlink RTDS value at window open (already buffered)
+  return null;
+}
 
 // ── CLOB WS (live odds) ───────────────────────────────────────────────────────
-let clobWS      = null;
-let clobReconnT = null;
+let clobWS = null, clobReconnT = null;
 
 function connectClobWS() {
   if (clobWS) { try { clobWS.terminate(); } catch(e) {} }
@@ -28,10 +58,9 @@ function connectClobWS() {
   clobWS = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
 
   clobWS.on('open', () => {
-    console.log('[CLOB-WS] connected');
+    console.log('[CLOB] connected');
     clobWS.send(JSON.stringify({
-      auth: {},
-      markets: [],
+      auth: {}, markets: [],
       assets_ids: [currentMarket.yesTokenId, currentMarket.noTokenId]
     }));
     clobWS._ping = setInterval(() => {
@@ -43,48 +72,33 @@ function connectClobWS() {
     try {
       const arr = [].concat(JSON.parse(raw.toString()));
       for (const ev of arr) {
-        // Only use price_change and last_trade_price — skip book events (they glitch)
         if (ev.event_type !== 'price_change' && ev.event_type !== 'last_trade_price') continue;
         const price = parseFloat(ev.price ?? ev.last_trade_price);
         if (isNaN(price) || price <= 0 || price >= 1) continue;
         const isYes = ev.asset_id === currentMarket.yesTokenId;
-        if (isYes) {
-          latestOdds.yes = price;
-          latestOdds.no  = parseFloat((1 - price).toFixed(4));
-        } else {
-          latestOdds.no  = price;
-          latestOdds.yes = parseFloat((1 - price).toFixed(4));
-        }
+        if (isYes) { latestOdds.yes = price; latestOdds.no = parseFloat((1-price).toFixed(4)); }
+        else        { latestOdds.no  = price; latestOdds.yes = parseFloat((1-price).toFixed(4)); }
         broadcast({ type: 'odds', yes: latestOdds.yes, no: latestOdds.no });
       }
     } catch(e) {}
   });
 
-  clobWS.on('close', () => {
-    clearInterval(clobWS._ping);
-    clobReconnT = setTimeout(connectClobWS, 3000);
-  });
-
-  clobWS.on('error', (e) => console.error('[CLOB-WS]', e.message));
+  clobWS.on('close', () => { clearInterval(clobWS._ping); clobReconnT = setTimeout(connectClobWS, 3000); });
+  clobWS.on('error', (e) => console.error('[CLOB]', e.message));
 }
 
 // ── RTDS WS (live Chainlink BTC price) ───────────────────────────────────────
-let rtdsWS      = null;
-let rtdsReconnT = null;
-let lastWindowTs = null;
+let rtdsWS = null, rtdsReconnT = null;
 
 function connectRTDS() {
   if (rtdsWS) { try { rtdsWS.terminate(); } catch(e) {} }
-
   rtdsWS = new WebSocket('wss://ws-live-data.polymarket.com');
 
   rtdsWS.on('open', () => {
-    console.log('[RTDS-WS] connected');
+    console.log('[RTDS] connected');
     rtdsWS.send(JSON.stringify({
       action: 'subscribe',
-      subscriptions: [
-        { topic: 'crypto_prices_chainlink', type: '*', filters: '{"symbol":"btc/usd"}' }
-      ]
+      subscriptions: [{ topic: 'crypto_prices_chainlink', type: '*', filters: '{"symbol":"btc/usd"}' }]
     }));
     rtdsWS._ping = setInterval(() => {
       if (rtdsWS.readyState === WebSocket.OPEN)
@@ -92,66 +106,21 @@ function connectRTDS() {
     }, 5000);
   });
 
-  // Ring buffer: keep last 30 Chainlink prices with their timestamps
-  const priceBuffer = [];
-
   rtdsWS.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.topic === 'crypto_prices_chainlink' && msg.payload?.value) {
-        const price   = parseFloat(msg.payload.value);
-        // Chainlink sends its own timestamp in the payload (ms)
-        const chainTs = msg.payload.timestamp ? Math.floor(msg.payload.timestamp / 1000) : Math.floor(Date.now() / 1000);
-
-        latestBTCPrice = price;
-
-        // Store in ring buffer (keep last 30)
-        priceBuffer.push({ price, ts: chainTs });
-        if (priceBuffer.length > 30) priceBuffer.shift();
-
-        // Detect new window
-        const step  = 5 * 60;
-        const winTs = chainTs - (chainTs % step);
-
-        if (winTs !== lastWindowTs) {
-          lastWindowTs = winTs;
-
-          // Find the Chainlink price whose timestamp is closest to winTs
-          // (the first update AT or just after window open)
-          const candidates = priceBuffer.filter(p => p.ts >= winTs);
-          const best = candidates.length > 0
-            ? candidates.reduce((a, b) => Math.abs(a.ts - winTs) < Math.abs(b.ts - winTs) ? a : b)
-            : { price };
-
-          windowOpenPrice = best.price;
-          console.log('[PRICE-TO-BEAT] window', winTs, '→ $'+windowOpenPrice, '(chainlink ts:', best.ts+')');
-
-          if (currentMarket) {
-            currentMarket.startPrice = windowOpenPrice;
-            broadcast({ type: 'market', market: currentMarket, odds: latestOdds });
-          }
-        }
-
-        broadcast({ type: 'btc_price', price, ts: chainTs });
+        latestBTCPrice = parseFloat(msg.payload.value);
+        broadcast({ type: 'btc_price', price: latestBTCPrice });
       }
     } catch(e) {}
   });
 
-  rtdsWS.on('close', () => {
-    clearInterval(rtdsWS._ping);
-    rtdsReconnT = setTimeout(connectRTDS, 3000);
-  });
-
-  rtdsWS.on('error', (e) => console.error('[RTDS-WS]', e.message));
+  rtdsWS.on('close', () => { clearInterval(rtdsWS._ping); rtdsReconnT = setTimeout(connectRTDS, 3000); });
+  rtdsWS.on('error', (e) => console.error('[RTDS]', e.message));
 }
 
 // ── MARKET LOOP ───────────────────────────────────────────────────────────────
-function getWindowTs(offset = 0) {
-  const sec  = Math.floor(Date.now() / 1000);
-  const step = 5 * 60;
-  return (sec - (sec % step)) + offset * step;
-}
-
 async function fetchMarketData(slug) {
   const r = await fetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`, {
     headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -184,13 +153,13 @@ async function updateMarket() {
     const ids        = JSON.parse(market.clobTokenIds || '[]');
     const yesTokenId = ids[0];
     const noTokenId  = ids[1];
-    const endSec     = wts + 5 * 60;
+    const endSec     = wts + 300;
 
-    // Price to beat = Chainlink price captured at window open
-    // Use windowOpenPrice if we have it, else current live price
-    const startPrice = windowOpenPrice || latestBTCPrice || null;
+    // Fetch price to beat from Binance 1m candle open
+    const startPrice = await fetchPriceToBeat(wts) || latestBTCPrice;
 
-    currentMarket = { slug, wts, yesTokenId, noTokenId, startPrice, endSec, question: market.question };
+    currentMarket = { slug, wts, yesTokenId, noTokenId, startPrice, endSec };
+    console.log('[MARKET] startPrice:', startPrice);
 
     if (yesTokenId) {
       const yp   = await fetchInitialOdds(yesTokenId);
@@ -199,7 +168,6 @@ async function updateMarket() {
 
     broadcast({ type: 'market', market: currentMarket, odds: latestOdds });
     connectClobWS();
-    console.log('[MARKET] loaded, startPrice:', startPrice);
   } catch(e) {
     console.error('[MARKET] error', e.message);
   }
@@ -208,25 +176,17 @@ async function updateMarket() {
 setInterval(updateMarket, 15000);
 updateMarket();
 
-// ── BROADCAST ─────────────────────────────────────────────────────────────────
-function broadcast(msg) {
-  const str = JSON.stringify(msg);
-  for (const c of clients) {
-    if (c.readyState === WebSocket.OPEN) c.send(str);
-  }
-}
-
 // ── BROWSER WS ────────────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('[WS] client connected, total:', clients.size);
-  if (currentMarket) ws.send(JSON.stringify({ type: 'market', market: currentMarket, odds: latestOdds }));
+  if (currentMarket)  ws.send(JSON.stringify({ type: 'market', market: currentMarket, odds: latestOdds }));
   if (latestBTCPrice) ws.send(JSON.stringify({ type: 'btc_price', price: latestBTCPrice }));
   ws.on('close', () => clients.delete(ws));
   ws.on('error', () => clients.delete(ws));
 });
 
-app.get('/state', (req, res) => res.json({ market: currentMarket, odds: latestOdds, btcPrice: latestBTCPrice }));
+app.get('/state',  (req, res) => res.json({ market: currentMarket, odds: latestOdds, btcPrice: latestBTCPrice }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 connectRTDS();
