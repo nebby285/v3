@@ -192,6 +192,30 @@ wss.on('connection', (ws) => {
 app.get('/state',  (req, res) => res.json({ market: currentMarket, odds: latestOdds, btcPrice: latestBTCPrice }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// ── PERSISTENT TRACKER ────────────────────────────────────────────────────────
+// Stored in memory on the server — survives browser closes, works across devices
+// Resets only when Railway restarts (which is rare)
+let trackerData = {
+  wins: 0, losses: 0, skips: 0,
+  history: []  // last 50 entries
+};
+
+// GET tracker — frontend loads this on page open
+app.get('/tracker', (req, res) => {
+  res.json(trackerData);
+});
+
+// POST tracker — frontend sends updated tracker after each resolved window
+app.post('/tracker', (req, res) => {
+  const { wins, losses, skips, history } = req.body;
+  if (typeof wins === 'number') trackerData.wins   = wins;
+  if (typeof losses === 'number') trackerData.losses = losses;
+  if (typeof skips === 'number') trackerData.skips  = skips;
+  if (Array.isArray(history)) trackerData.history   = history.slice(-50);
+  console.log(`[TRACKER] W:${trackerData.wins} L:${trackerData.losses} S:${trackerData.skips}`);
+  res.json({ ok: true });
+});
+
 connectRTDS();
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`[SERVER] running on port ${PORT}`));
