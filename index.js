@@ -249,17 +249,11 @@ function signalVolumeSurge(c) {
 // Returns confidence modifier and whether we should even fire yet.
 function signalTimeInWindow(secsLeft, total=300) {
   const elapsed = total - secsLeft;
-  const elapsedPct = elapsed / total;
-
-  // Too early (< 60s elapsed) — not enough info, delay firing
-  if(elapsed < 60)  return { confidence_mod:-0.25, shouldFire:false, note:`too early (${elapsed}s elapsed) — waiting` };
-  // Sweet spot: 90s–180s elapsed (T-210s to T-120s remaining)
+  if(elapsed < 30)  return { confidence_mod:-0.3, shouldFire:false, note:`too early (${elapsed}s elapsed)` };
   if(elapsed >= 90 && elapsed <= 180) return { confidence_mod:0.15, shouldFire:true, note:`optimal window (${elapsed}s elapsed)` };
-  // Good: 60–90s or 180–240s elapsed
-  if(elapsed >= 60 && elapsed < 90)  return { confidence_mod:0.05, shouldFire:true, note:`early-mid window (${elapsed}s)` };
+  if(elapsed >= 30 && elapsed < 90)  return { confidence_mod:0.0, shouldFire:true, note:`early window (${elapsed}s)` };
   if(elapsed > 180 && elapsed <= 240) return { confidence_mod:0.05, shouldFire:true, note:`mid-late window (${elapsed}s)` };
-  // Very late (> 240s = last 60s) — token already priced in, skip
-  if(elapsed > 240) return { confidence_mod:-0.15, shouldFire:true, note:`late window — token priced in` };
+  if(elapsed > 240) return { confidence_mod:-0.1, shouldFire:true, note:`late window — token priced in` };
   return { confidence_mod:0, shouldFire:true, note:`${elapsed}s elapsed` };
 }
 
@@ -313,9 +307,11 @@ async function runEngine() {
 
   const elapsed = 300 - secsLeft;
 
-  // ── TIMING GATE — don't fire before 60s elapsed ───────────────────────────
-  if(elapsed < 60) {
-    console.log(`[ENGINE] too early (${elapsed}s), waiting for 60s mark`);
+  // ── TIMING GATE — fire after 30s, optimal at 90-180s ─────────────────────
+  if(elapsed < 30) {
+    console.log(`[ENGINE] too early (${elapsed}s elapsed), waiting for 30s mark`);
+    // Broadcast a "waiting" state so frontend knows engine is alive
+    broadcast({ type:'engine_waiting', secsLeft, elapsed, windowWts: currentMarket.wts });
     return;
   }
 
@@ -472,9 +468,21 @@ async function runEngine() {
 }
 
 // ── ENGINE LOOP ───────────────────────────────────────────────────────────────
-// Runs every 10 seconds — but only fires a decision once per window
-// after the 60s timing gate
+// Runs every 10 seconds
 setInterval(runEngine, 10000);
+
+// Also run immediately when market loads
+async function runEngineNow() {
+  await runEngine();
+}
+
+// Startup: run engine as soon as we have market + price data
+let startupTimer = setInterval(() => {
+  if(currentMarket && latestBTCPrice && currentMarket.startPrice) {
+    clearInterval(startupTimer);
+    runEngine();
+  }
+}, 2000);
 
 // ── RESOLVE PREVIOUS WINDOW ───────────────────────────────────────────────────
 function resolveLastDecision(newWindowWts) {
