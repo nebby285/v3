@@ -58,21 +58,8 @@ function connectClobWS() {
           }
           broadcast({ type: 'odds', yes: latestOdds.yes, no: latestOdds.no });
         }
-        if (ev.event_type === 'book') {
-          // Use midpoint from best bid/ask
-          const asks = ev.asks || [];
-          if (asks.length > 0) {
-            const bestAsk = parseFloat(asks[0].price);
-            if (!isNaN(bestAsk)) {
-              const isYes = ev.asset_id === currentMarket.yesTokenId;
-              if (isYes) {
-                latestOdds.yes = bestAsk;
-                latestOdds.no  = parseFloat((1 - bestAsk).toFixed(4));
-              }
-              broadcast({ type: 'odds', yes: latestOdds.yes, no: latestOdds.no });
-            }
-          }
-        }
+        // intentionally skip 'book' events — they contain full orderbook snapshots
+        // and the best ask is not the same as the market price, causes glitching
       }
     } catch(e) {}
   });
@@ -145,6 +132,17 @@ function getWindowTs(offset = 0) {
 }
 
 async function fetchMarketData(slug) {
+  // Try events endpoint first — has more fields including startPrice
+  try {
+    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    const d = await r.json();
+    if (Array.isArray(d) && d.length && d[0].markets?.length) {
+      return d[0].markets[0];
+    }
+  } catch(e) {}
+  // Fallback to markets endpoint
   const r = await fetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`, {
     headers: { 'User-Agent': 'Mozilla/5.0' }
   });
@@ -152,9 +150,37 @@ async function fetchMarketData(slug) {
   return Array.isArray(d) && d.length ? d[0] : null;
 }
 
+async function fetchStartPrice(tokenId, wts) {
+  // Get the price at window open from CLOB timeseries
+  try {
+    const startTs = wts;
+    const endTs   = wts + 60; // first minute
+    const r = await fetch(
+      `https://clob.polymarket.com/prices-history?market=${tokenId}&startTs=${startTs}&endTs=${endTs}&fidelity=1`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' } }
+    );
+    const d = await r.json();
+    if (d.history && d.history.length > 0) {
+      // first price in history is the opening price — but this is YES token price not BTC
+      // so we need the Chainlink price at that timestamp instead
+    }
+  } catch(e) {}
+  return null;
+}
+
 function extractStartPrice(market) {
-  if (market.startPrice && parseFloat(market.startPrice) > 0) return parseFloat(market.startPrice);
-  if (market.xAxisValue && parseFloat(market.xAxisValue) > 0) return parseFloat(market.xAxisValue);
+  // Try all known fields
+  const candidates = [
+    market.startPrice,
+    market.xAxisValue,
+    market.lowerBound,
+    market.startValue,
+  ];
+  for (const c of candidates) {
+    const v = parseFloat(c);
+    if (!isNaN(v) && v > 10000) return v;
+  }
+  // Parse from question/description text
   const sources = [market.question || '', market.description || ''];
   for (const s of sources) {
     const matches = s.match(/\$([\d,]+\.?\d*)/g);
@@ -162,6 +188,9 @@ function extractStartPrice(market) {
       const prices = matches.map(m => parseFloat(m.replace(/[$,]/g,''))).filter(p => p > 10000);
       if (prices.length) return prices[0];
     }
+    // Also try plain numbers like 84231.50
+    const plain = s.match(/\b(8\d{4}|9\d{4}|7\d{4})\.\d+/g);
+    if (plain) return parseFloat(plain[0]);
   }
   return null;
 }
@@ -195,7 +224,14 @@ async function updateMarket() {
     const endSec     = wts + 5 * 60;
 
     currentMarket = { slug, wts, yesTokenId, noTokenId, startPrice, endSec,
-      question: market.question, volume: market.volume, liquidity: market.liquidity };
+      question: market.question };
+
+    // If startPrice still null, use current BTC price as approximation
+    // (the real price to beat is the Chainlink price at window open — very close to live price)
+    if (!currentMarket.startPrice && latestBTCPrice) {
+      currentMarket.startPrice = latestBTCPrice;
+      console.log('[MARKET] using live BTC as startPrice fallback:', latestBTCPrice);
+    }
 
     // get initial odds from REST
     if (yesTokenId) {
