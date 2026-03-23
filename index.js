@@ -615,7 +615,11 @@ wss.on('connection', (ws) => {
   console.log('[WS] client connected, total:', clients.size);
   if(currentMarket)  ws.send(JSON.stringify({ type:'market', market:currentMarket, odds:latestOdds }));
   if(latestBTCPrice) ws.send(JSON.stringify({ type:'btc_price', price:latestBTCPrice }));
-  if(lockedDecision && !lockedDecision.resolved) ws.send(JSON.stringify({ type:'decision', decision:lockedDecision }));
+  // Send locked decision if exists for current window
+  if(lockedDecision && !lockedDecision.resolved && lockedDecision.wts === getWindowTs(0)) {
+    ws.send(JSON.stringify({ type:'decision', decision:lockedDecision }));
+  }
+  // Always send tracker
   ws.send(JSON.stringify({ type:'tracker', tracker:trackerData }));
   ws.on('close', () => clients.delete(ws));
   ws.on('error', () => clients.delete(ws));
