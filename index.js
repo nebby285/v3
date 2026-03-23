@@ -26,25 +26,28 @@ function broadcast(msg) {
   for (const c of clients) if (c.readyState === WebSocket.OPEN) c.send(s);
 }
 
-// ── PRICE TO BEAT — fetch Binance 1m candle open at window start ──────────────
-// This is EXACTLY how Polymarket determines the price to beat:
-// the Chainlink/market price at the window open timestamp.
-// Binance 1m open is the best public proxy for this.
+// Price to beat = Binance 1m candle OPEN at the exact window start timestamp
+// We query startTime=windowTs*1000 and get 3 candles to be safe, take the first one's open
 async function fetchPriceToBeat(windowTs) {
   try {
-    // Binance: get the 1-minute candle that starts at windowTs
-    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=${windowTs * 1000}&limit=1`;
-    const r   = await fetch(url, { signal: AbortSignal.timeout(4000) });
-    const d   = await r.json();
-    if (Array.isArray(d) && d.length) {
-      const openPrice = parseFloat(d[0][1]); // index 1 = open price
-      console.log('[PTB] Binance 1m open at', windowTs, '=', openPrice);
+    // Primary: Binance exact 1m candle open at window timestamp
+    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=${windowTs*1000}&endTime=${(windowTs+180)*1000}&limit=3`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    if (Array.isArray(d) && d.length > 0) {
+      // Find the candle whose open time matches windowTs most closely
+      const target = windowTs * 1000;
+      let best = d[0];
+      for (const c of d) {
+        if (Math.abs(c[0] - target) < Math.abs(best[0] - target)) best = c;
+      }
+      const openPrice = parseFloat(best[1]);
+      console.log('[PTB] Binance candle open:', openPrice, 'candle ts:', new Date(best[0]).toISOString(), 'target:', new Date(target).toISOString());
       return openPrice;
     }
   } catch(e) {
     console.error('[PTB] Binance error:', e.message);
   }
-  // Fallback: Chainlink RTDS value at window open (already buffered)
   return null;
 }
 
