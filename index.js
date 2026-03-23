@@ -92,31 +92,47 @@ function connectRTDS() {
     }, 5000);
   });
 
+  // Ring buffer: keep last 30 Chainlink prices with their timestamps
+  const priceBuffer = [];
+
   rtdsWS.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.topic === 'crypto_prices_chainlink' && msg.payload?.value) {
-        const price = parseFloat(msg.payload.value);
+        const price   = parseFloat(msg.payload.value);
+        // Chainlink sends its own timestamp in the payload (ms)
+        const chainTs = msg.payload.timestamp ? Math.floor(msg.payload.timestamp / 1000) : Math.floor(Date.now() / 1000);
+
         latestBTCPrice = price;
 
-        // Capture price to beat at the START of each new window
-        const nowSec  = Math.floor(Date.now() / 1000);
-        const step    = 5 * 60;
-        const winTs   = nowSec - (nowSec % step);
+        // Store in ring buffer (keep last 30)
+        priceBuffer.push({ price, ts: chainTs });
+        if (priceBuffer.length > 30) priceBuffer.shift();
+
+        // Detect new window
+        const step  = 5 * 60;
+        const winTs = chainTs - (chainTs % step);
 
         if (winTs !== lastWindowTs) {
-          // New window just started — lock this as price to beat
-          windowOpenPrice = price;
-          lastWindowTs    = winTs;
-          console.log('[PRICE-TO-BEAT] new window', winTs, '→', price);
-          // Update market and broadcast
+          lastWindowTs = winTs;
+
+          // Find the Chainlink price whose timestamp is closest to winTs
+          // (the first update AT or just after window open)
+          const candidates = priceBuffer.filter(p => p.ts >= winTs);
+          const best = candidates.length > 0
+            ? candidates.reduce((a, b) => Math.abs(a.ts - winTs) < Math.abs(b.ts - winTs) ? a : b)
+            : { price };
+
+          windowOpenPrice = best.price;
+          console.log('[PRICE-TO-BEAT] window', winTs, '→ $'+windowOpenPrice, '(chainlink ts:', best.ts+')');
+
           if (currentMarket) {
-            currentMarket.startPrice = price;
+            currentMarket.startPrice = windowOpenPrice;
             broadcast({ type: 'market', market: currentMarket, odds: latestOdds });
           }
         }
 
-        broadcast({ type: 'btc_price', price, ts: msg.payload.timestamp });
+        broadcast({ type: 'btc_price', price, ts: chainTs });
       }
     } catch(e) {}
   });
