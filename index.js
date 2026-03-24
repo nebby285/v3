@@ -342,7 +342,7 @@ async function runEngine() {
 
   const time = new Date(currentMarket.wts * 1000).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York' });
   trackerData.history = trackerData.history.filter(h => h.window !== currentMarket.wts);
-  trackerData.history.push({ time, decision, result: 'PENDING', window: currentMarket.wts });
+  trackerData.history.push({ time, decision, result: 'PENDING', window: currentMarket.wts, conf: Math.round(conf*100) });
   if (trackerData.history.length > 20) trackerData.history.shift();
   broadcast({ type: 'tracker', tracker: trackerData });
 }
