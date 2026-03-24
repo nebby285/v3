@@ -192,11 +192,8 @@ function runEngine() {
   const total = bull + bear;
   const edge = Math.abs(bull - bear);
   // Time factor: 0 at 60s, 1.0 at 3min — confidence grows as window progresses
-  const timeFactor = Math.min((elapsed - 60) / 120, 1);
-  let conf = total > 0 ? (edge / total) * timeFactor : 0;
-  if (Math.abs(delta) < 0.005) conf = Math.min(conf, 0.2); // tiny delta = uncertain
-  conf = Math.max(0, Math.min(1, conf));
-  const quality = Math.max(0, Math.min(1, (conf + timeFactor) / 2));
+  const conf = Math.max(0, Math.min(1, total > 0 ? edge / total : 0));
+  const quality = Math.max(0, Math.min(1, conf * 0.7 + Math.min(elapsed / 300, 1) * 0.3));
 
   let decision = 'NO TRADE', reason = '';
   // Only NO TRADE if delta is genuinely flat (within ±0.002%)
