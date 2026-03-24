@@ -15,6 +15,16 @@ let latestBTCPrice = null;
 let clients        = new Set();
 let trackerData    = { wins: 0, losses: 0, skips: 0, history: [] };
 
+// Rolling 90s buffer of Chainlink prices — lets us look up exact price at any past timestamp
+const chainlinkBuffer=[];
+function getChainlinkAtTime(targetMs){
+  if(!chainlinkBuffer.length) return latestBTCPrice;
+  let best=chainlinkBuffer[0];
+  for(const e of chainlinkBuffer) if(Math.abs(e.ts-targetMs)<Math.abs(best.ts-targetMs)) best=e;
+  console.log('[BUFFER] looked up',new Date(targetMs).toISOString(),'→ found',best.price,'at',new Date(best.ts).toISOString(),'(diff',Math.abs(best.ts-targetMs),'ms)');
+  return best.price;
+}
+
 // Snapshot Chainlink price at exact window boundary
 let windowPriceSnapshot = null;
 let lastSnapWts = 0;
@@ -86,6 +96,10 @@ function connectRTDS(){
       const msg=JSON.parse(raw.toString());
       if(msg.topic==='crypto_prices_chainlink'&&msg.payload?.value){
         latestBTCPrice=parseFloat(msg.payload.value);
+        // Store in buffer with timestamp for exact historical lookup
+        const now=Date.now();
+        chainlinkBuffer.push({ts:now,price:latestBTCPrice});
+        if(chainlinkBuffer.length>180) chainlinkBuffer.shift(); // keep ~90s at 2/sec
         // Add to buffer with current timestamp
         const now=Date.now();
         chainlinkBuffer.push({ts:now, price:latestBTCPrice});
@@ -145,7 +159,7 @@ async function updateMarket(){
     }
     lockedDecision=null; // clear for new window
     // Use snapshot taken at window boundary, fall back to current price
-    const startPrice=windowPriceSnapshot||latestBTCPrice||await fetchPriceToBeat(wts);
+    const startPrice=getChainlinkAtTime(wts*1000)||windowPriceSnapshot||latestBTCPrice||await fetchPriceToBeat(wts);
     currentMarket={slug,wts,yesTokenId,noTokenId,startPrice,endSec};
     console.log('[MARKET] startPrice:',startPrice);
     if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
@@ -215,6 +229,30 @@ wss.on('connection',(ws)=>{
 });
 
 // REST
+// Resolve endpoint — browser tells server when window closes, server does math ONCE
+// Uses a set to track which windows have already been resolved (prevents double counting)
+const resolvedWindows = new Set();
+app.post('/resolve',(req,res)=>{
+  const{wts,decision,startPrice,btcPrice}=req.body;
+  if(!wts||!decision) return res.json({ok:false});
+  // Already resolved this window — ignore
+  if(resolvedWindows.has(wts)) return res.json({ok:true,ignored:true});
+  resolvedWindows.add(wts);
+  let result='SKIP';
+  if(decision!=='NO TRADE'&&btcPrice&&startPrice){
+    const won=(decision==='BUY UP'&&btcPrice>=startPrice)||(decision==='BUY DOWN'&&btcPrice<startPrice);
+    result=won?'WIN':'LOSS';
+    if(won)trackerData.wins++;else trackerData.losses++;
+  } else if(decision==='NO TRADE'){
+    trackerData.skips++;result='SKIP';
+  }
+  const idx=trackerData.history.findIndex(h=>h.window===wts);
+  if(idx>=0)trackerData.history[idx].result=result;
+  console.log(`[RESOLVE] wts:${wts} ${decision} → ${result} | W:${trackerData.wins} L:${trackerData.losses}`);
+  // Broadcast updated tracker to all clients
+  broadcast({type:'tracker',tracker:trackerData});
+  res.json({ok:true,result});
+});
 app.get('/candles',async(req,res)=>{
   try{
     const r=await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',{signal:AbortSignal.timeout(6000)});
