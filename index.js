@@ -331,6 +331,9 @@ async function runEngine() {
   if (absDelta < 0.002) {
     decision = 'NO TRADE';
     reason = `delta flat (${delta.toFixed(4)}%)`;
+  } else if (conf < 0.55) {
+    decision = 'NO TRADE';
+    reason = `confidence too low (${Math.round(conf*100)}%) — skipping`;
   } else if (bull > bear) {
     decision = 'BUY UP';
     reason = signals.slice(0,3).join(' · ');
