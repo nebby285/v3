@@ -346,6 +346,19 @@ async function fetchInitialOdds(tokenId) {
     return(!isNaN(p)&&p>0&&p<1)?p:0.5;
   }catch(e){return 0.5;}
 }
+// ── WINDOW BOUNDARY WATCHER ───────────────────────────────────────────────────
+// Checks every 500ms — the instant the window changes, snapshot the Chainlink price
+let windowPriceSnapshot = null;
+let lastSnapWts = 0;
+setInterval(()=>{
+  const wts = getWindowTs(0);
+  if(wts !== lastSnapWts && latestBTCPrice) {
+    windowPriceSnapshot = latestBTCPrice;
+    lastSnapWts = wts;
+    console.log('[SNAPSHOT] window',wts,'price to beat:',windowPriceSnapshot);
+  }
+}, 500);
+
 async function updateMarket() {
   const wts=getWindowTs(0), slug=`btc-updown-5m-${wts}`;
   if(currentMarket?.wts===wts) return;
@@ -357,12 +370,10 @@ async function updateMarket() {
     const yesTokenId=ids[0], noTokenId=ids[1];
     const endSec=wts+300;
     resolveLastDecision(wts);
-    // Use the live Chainlink price we're already receiving as price to beat
-    // This is EXACTLY what Polymarket uses — same feed, captured at window open
-    // Fall back to Binance candle only if Chainlink isn't available yet
-    const startPrice = latestBTCPrice || await fetchPriceToBeat(wts);
+    // Use snapshot taken at exact window boundary — same as Polymarket
+    const startPrice = windowPriceSnapshot || latestBTCPrice;
     currentMarket={slug,wts,yesTokenId,noTokenId,startPrice,endSec};
-    console.log('[MARKET] loaded startPrice:',startPrice,'(Chainlink live) endSec:',endSec);
+    console.log('[MARKET] startPrice:',startPrice,'endSec:',endSec);
     if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
     broadcast({type:'market',market:currentMarket,odds:latestOdds});
     connectClobWS();
@@ -391,6 +402,25 @@ app.get('/candles', async (req,res)=>{
     const d=await r.json();
     res.json(d);
   }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Serve the current locked decision — so refresh never loses it
+app.get('/decision',(req,res)=>{
+  if(lockedDecision && !lockedDecision.resolved) res.json(lockedDecision);
+  else res.json(null);
+});
+// Browser pushes its decision up so server holds it for other devices/refreshes
+app.post('/decision',(req,res)=>{
+  const d=req.body;
+  if(d && d.wts && d.decision){
+    // Only store if it's for the current window and not already resolved
+    if(!lockedDecision || d.wts >= lockedDecision.wts){
+      lockedDecision=d;
+      console.log('[DECISION] stored from client:',d.decision,'wts:',d.wts);
+      // Broadcast to all other connected clients
+      broadcast({type:'decision',decision:lockedDecision});
+    }
+  }
+  res.json({ok:true});
 });
 app.get('/health',(req,res)=>res.json({ok:true,market:currentMarket?.slug,btc:latestBTCPrice,locked:lockedDecision?.decision||null}));
 app.get('/tracker',(req,res)=>res.json(trackerData));
