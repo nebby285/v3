@@ -68,6 +68,10 @@ function connectClobWS(){
   clobWS.on('error',(e)=>console.error('[CLOB]',e.message));
 }
 
+// Rolling buffer of last 60 seconds of Chainlink prices with timestamps
+// So we can look back and find the exact price at any window boundary
+const chainlinkBuffer = []; // [{ts, price}]
+
 // RTDS WebSocket (Chainlink BTC price)
 let rtdsWS=null;
 function connectRTDS(){
@@ -82,12 +86,28 @@ function connectRTDS(){
       const msg=JSON.parse(raw.toString());
       if(msg.topic==='crypto_prices_chainlink'&&msg.payload?.value){
         latestBTCPrice=parseFloat(msg.payload.value);
+        // Add to buffer with current timestamp
+        const now=Date.now();
+        chainlinkBuffer.push({ts:now, price:latestBTCPrice});
+        // Keep only last 90 seconds
+        const cutoff=now-90000;
+        while(chainlinkBuffer.length&&chainlinkBuffer[0].ts<cutoff) chainlinkBuffer.shift();
         broadcast({type:'btc_price',price:latestBTCPrice});
       }
     }catch(e){}
   });
   rtdsWS.on('close',()=>{clearInterval(rtdsWS._ping);setTimeout(connectRTDS,3000);});
   rtdsWS.on('error',(e)=>console.error('[RTDS]',e.message));
+}
+
+// Get the Chainlink price closest to a given unix timestamp
+function getChainlinkAtTime(targetMs) {
+  if(!chainlinkBuffer.length) return latestBTCPrice;
+  let best = chainlinkBuffer[0];
+  for(const entry of chainlinkBuffer) {
+    if(Math.abs(entry.ts - targetMs) < Math.abs(best.ts - targetMs)) best = entry;
+  }
+  return best.price;
 }
 
 // Market loop
@@ -112,6 +132,18 @@ async function updateMarket(){
     if(!market){console.log('[MARKET] not found yet');return;}
     const ids=JSON.parse(market.clobTokenIds||'[]');
     const yesTokenId=ids[0],noTokenId=ids[1],endSec=wts+300;
+    // Resolve previous window decision
+    if(lockedDecision&&!lockedDecision.resolved&&lockedDecision.wts!==wts){
+      const won=lockedDecision.decision==='BUY UP'?latestBTCPrice>=lockedDecision.startPrice:lockedDecision.decision==='BUY DOWN'?latestBTCPrice<lockedDecision.startPrice:null;
+      if(won===null){trackerData.skips++;}else if(won){trackerData.wins++;}else{trackerData.losses++;}
+      const result=won===null?'SKIP':won?'WIN':'LOSS';
+      const idx=trackerData.history.findIndex(h=>h.window===lockedDecision.wts);
+      if(idx>=0)trackerData.history[idx].result=result;
+      lockedDecision.resolved=true;
+      console.log('[TRACKER]',lockedDecision.decision,'→',result,'W:'+trackerData.wins,'L:'+trackerData.losses);
+      broadcast({type:'tracker',tracker:trackerData});
+    }
+    lockedDecision=null; // clear for new window
     // Use snapshot taken at window boundary, fall back to current price
     const startPrice=windowPriceSnapshot||latestBTCPrice||await fetchPriceToBeat(wts);
     currentMarket={slug,wts,yesTokenId,noTokenId,startPrice,endSec};
@@ -119,10 +151,56 @@ async function updateMarket(){
     if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
     broadcast({type:'market',market:currentMarket,odds:latestOdds});
     connectClobWS();
+    // Run engine after market loads
+    setTimeout(runEngine, 2000);
   }catch(e){console.error('[MARKET]',e.message);}
 }
 setInterval(updateMarket,15000);
 updateMarket();
+
+// ── ENGINE (server-side, one decision per window, same for all devices) ────────
+let lockedDecision = null;
+
+function runEngine(){
+  if(!currentMarket||!latestBTCPrice||!currentMarket.startPrice) return;
+  const secsLeft=Math.max(0,currentMarket.endSec-Math.floor(Date.now()/1000));
+  if(secsLeft<=0) return;
+  // Already locked for this window — re-broadcast to any new clients
+  if(lockedDecision&&lockedDecision.wts===currentMarket.wts&&!lockedDecision.resolved){
+    broadcast({type:'decision',decision:lockedDecision});
+    return;
+  }
+  const cp=latestBTCPrice,sp=currentMarket.startPrice,yp=latestOdds.yes,np=latestOdds.no;
+  const elapsed=300-secsLeft,delta=((cp-sp)/sp)*100;
+  let bull=0,bear=0;
+  if(delta>0.10)bull+=8;else if(delta>0.05)bull+=6.4;else if(delta>0.02)bull+=4.8;else if(delta>0.005)bull+=2.4;
+  else if(delta<-0.10)bear+=8;else if(delta<-0.05)bear+=6.4;else if(delta<-0.02)bear+=4.8;else if(delta<-0.005)bear+=2.4;
+  if(yp>0.70)bull+=2;else if(yp>0.55)bull+=1.2;else if(np>0.70)bear+=2;else if(np>0.55)bear+=1.2;
+  if(elapsed>=90&&elapsed<=180){if(bull>bear)bull+=0.5;else bear+=0.5;}
+  const total=bull+bear,edge=Math.abs(bull-bear);
+  const conf=Math.max(0,Math.min(1,total>0?edge/total:0));
+  const quality=Math.max(0,Math.min(1,conf*0.8+(Math.min(elapsed,180)/180)*0.2));
+  let decision='NO TRADE',reason='';
+  if(conf<0.25){decision='NO TRADE';reason='confidence too low ('+Math.round(conf*100)+'%)';}
+  else if(edge<0.8){decision='NO TRADE';reason='edge too small ('+edge.toFixed(1)+')';}
+  else if(bull>bear){decision='BUY UP';reason='delta +'+delta.toFixed(3)+'% | bull '+bull.toFixed(1)+' vs bear '+bear.toFixed(1);}
+  else{decision='BUY DOWN';reason='delta '+delta.toFixed(3)+'% | bear '+bear.toFixed(1)+' vs bull '+bull.toFixed(1);}
+  console.log('[ENGINE]',decision,'| conf:'+Math.round(conf*100)+'% edge:'+edge.toFixed(1)+'delta:'+delta.toFixed(3)+'%');
+  lockedDecision={wts:currentMarket.wts,decision,reason,bull,bear,conf,quality,edge,startPrice:sp,lockedAt:Date.now(),lockedAtElapsed:elapsed,resolved:false};
+  broadcast({type:'decision',decision:lockedDecision});
+  // Add PENDING to tracker
+  const time=new Date(currentMarket.wts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'America/New_York'});
+  trackerData.history=trackerData.history.filter(h=>h.window!==currentMarket.wts);
+  trackerData.history.push({time,decision,result:'PENDING',window:currentMarket.wts});
+  if(trackerData.history.length>50)trackerData.history.shift();
+  broadcast({type:'tracker',tracker:trackerData});
+}
+
+// Re-run engine every 30s in case odds shifted enough to flip (but decision stays locked)
+setInterval(()=>{
+  if(!lockedDecision||lockedDecision.wts!==getWindowTs()) runEngine();
+  else broadcast({type:'decision',decision:lockedDecision}); // keep re-broadcasting to late joiners
+},30000);
 
 // Browser WebSocket
 wss.on('connection',(ws)=>{
@@ -130,6 +208,7 @@ wss.on('connection',(ws)=>{
   console.log('[WS] client connected, total:',clients.size);
   if(currentMarket)  ws.send(JSON.stringify({type:'market',market:currentMarket,odds:latestOdds}));
   if(latestBTCPrice) ws.send(JSON.stringify({type:'btc_price',price:latestBTCPrice}));
+  if(lockedDecision&&!lockedDecision.resolved) ws.send(JSON.stringify({type:'decision',decision:lockedDecision}));
   ws.send(JSON.stringify({type:'tracker',tracker:trackerData}));
   ws.on('close',()=>clients.delete(ws));
   ws.on('error',()=>clients.delete(ws));
