@@ -158,42 +158,47 @@ function runEngine(){
   if(!currentMarket||!latestBTCPrice||!currentMarket.startPrice) return;
   const secsLeft=Math.max(0,currentMarket.endSec-Math.floor(Date.now()/1000));
   if(secsLeft<=0) return;
-  // Already locked for this window — re-broadcast to any new clients
+  const elapsed=300-secsLeft;
+  // Wait 60s before deciding — not enough info before then
+  if(elapsed<60){ broadcast({type:'engine_waiting',elapsed}); return; }
+  // Already locked — just re-broadcast
   if(lockedDecision&&lockedDecision.wts===currentMarket.wts&&!lockedDecision.resolved){
-    broadcast({type:'decision',decision:lockedDecision});
-    return;
+    broadcast({type:'decision',decision:lockedDecision}); return;
   }
   const cp=latestBTCPrice,sp=currentMarket.startPrice,yp=latestOdds.yes,np=latestOdds.no;
-  const elapsed=300-secsLeft,delta=((cp-sp)/sp)*100;
+  const delta=((cp-sp)/sp)*100;
   let bull=0,bear=0;
   if(delta>0.10)bull+=8;else if(delta>0.05)bull+=6.4;else if(delta>0.02)bull+=4.8;else if(delta>0.005)bull+=2.4;
   else if(delta<-0.10)bear+=8;else if(delta<-0.05)bear+=6.4;else if(delta<-0.02)bear+=4.8;else if(delta<-0.005)bear+=2.4;
   if(yp>0.70)bull+=2;else if(yp>0.55)bull+=1.2;else if(np>0.70)bear+=2;else if(np>0.55)bear+=1.2;
-  if(elapsed>=90&&elapsed<=180){if(bull>bear)bull+=0.5;else bear+=0.5;}
   const total=bull+bear,edge=Math.abs(bull-bear);
-  const conf=Math.max(0,Math.min(1,total>0?edge/total:0));
-  const quality=Math.max(0,Math.min(1,conf*0.8+(Math.min(elapsed,180)/180)*0.2));
+  // Confidence scaled by time — early in window = lower confidence even with clear delta
+  const timeFactor=Math.min((elapsed-60)/120,1); // 0 at 60s, 1.0 at 3min
+  let conf=total>0?(edge/total)*timeFactor:0;
+  // If delta tiny — genuinely uncertain
+  if(Math.abs(delta)<0.005) conf=Math.min(conf,0.25);
+  conf=Math.max(0,Math.min(1,conf));
+  const quality=Math.max(0,Math.min(1,(conf+timeFactor)/2));
   let decision='NO TRADE',reason='';
-  if(conf<0.25){decision='NO TRADE';reason='confidence too low ('+Math.round(conf*100)+'%)';}
-  else if(edge<0.8){decision='NO TRADE';reason='edge too small ('+edge.toFixed(1)+')';}
-  else if(bull>bear){decision='BUY UP';reason='delta +'+delta.toFixed(3)+'% | bull '+bull.toFixed(1)+' vs bear '+bear.toFixed(1);}
-  else{decision='BUY DOWN';reason='delta '+delta.toFixed(3)+'% | bear '+bear.toFixed(1)+' vs bull '+bull.toFixed(1);}
-  console.log('[ENGINE]',decision,'| conf:'+Math.round(conf*100)+'% edge:'+edge.toFixed(1)+'delta:'+delta.toFixed(3)+'%');
+  if(conf<0.40){decision='NO TRADE';reason='confidence too low ('+Math.round(conf*100)+'%) at T+'+elapsed+'s';}
+  else if(edge<1.5){decision='NO TRADE';reason='edge too small ('+edge.toFixed(1)+')';}
+  else if(bull>bear){decision='BUY UP';reason='delta +'+delta.toFixed(3)+'% | bull '+bull.toFixed(1)+' vs bear '+bear.toFixed(1)+' | conf '+Math.round(conf*100)+'%';}
+  else{decision='BUY DOWN';reason='delta '+delta.toFixed(3)+'% | bear '+bear.toFixed(1)+' vs bull '+bull.toFixed(1)+' | conf '+Math.round(conf*100)+'%';}
+  console.log('[ENGINE]',decision,'conf:'+Math.round(conf*100)+'% edge:'+edge.toFixed(1)+' elapsed:'+elapsed+'s delta:'+delta.toFixed(3)+'%');
   lockedDecision={wts:currentMarket.wts,decision,reason,bull,bear,conf,quality,edge,startPrice:sp,lockedAt:Date.now(),lockedAtElapsed:elapsed,resolved:false};
   broadcast({type:'decision',decision:lockedDecision});
-  // Add PENDING to tracker
   const time=new Date(currentMarket.wts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'America/New_York'});
   trackerData.history=trackerData.history.filter(h=>h.window!==currentMarket.wts);
   trackerData.history.push({time,decision,result:'PENDING',window:currentMarket.wts});
-  if(trackerData.history.length>50)trackerData.history.shift();
+  if(trackerData.history.length>20)trackerData.history.shift();
   broadcast({type:'tracker',tracker:trackerData});
 }
 
-// Re-run engine every 30s in case odds shifted enough to flip (but decision stays locked)
+// Run engine every 10s — fires decision once 60s gate is passed
 setInterval(()=>{
   if(!lockedDecision||lockedDecision.wts!==getWindowTs()) runEngine();
-  else broadcast({type:'decision',decision:lockedDecision}); // keep re-broadcasting to late joiners
-},30000);
+  else broadcast({type:'decision',decision:lockedDecision});
+},10000);
 
 // Browser WebSocket
 wss.on('connection',(ws)=>{
@@ -208,30 +213,6 @@ wss.on('connection',(ws)=>{
 });
 
 // REST
-// Resolve endpoint — browser tells server when window closes, server does math ONCE
-// Uses a set to track which windows have already been resolved (prevents double counting)
-const resolvedWindows = new Set();
-app.post('/resolve',(req,res)=>{
-  const{wts,decision,startPrice,btcPrice}=req.body;
-  if(!wts||!decision) return res.json({ok:false});
-  // Already resolved this window — ignore
-  if(resolvedWindows.has(wts)) return res.json({ok:true,ignored:true});
-  resolvedWindows.add(wts);
-  let result='SKIP';
-  if(decision!=='NO TRADE'&&btcPrice&&startPrice){
-    const won=(decision==='BUY UP'&&btcPrice>=startPrice)||(decision==='BUY DOWN'&&btcPrice<startPrice);
-    result=won?'WIN':'LOSS';
-    if(won)trackerData.wins++;else trackerData.losses++;
-  } else if(decision==='NO TRADE'){
-    trackerData.skips++;result='SKIP';
-  }
-  const idx=trackerData.history.findIndex(h=>h.window===wts);
-  if(idx>=0)trackerData.history[idx].result=result;
-  console.log(`[RESOLVE] wts:${wts} ${decision} → ${result} | W:${trackerData.wins} L:${trackerData.losses}`);
-  // Broadcast updated tracker to all clients
-  broadcast({type:'tracker',tracker:trackerData});
-  res.json({ok:true,result});
-});
 app.get('/candles',async(req,res)=>{
   try{
     const r=await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',{signal:AbortSignal.timeout(6000)});
@@ -240,14 +221,6 @@ app.get('/candles',async(req,res)=>{
 });
 app.get('/health',(req,res)=>res.json({ok:true,market:currentMarket?.slug,btc:latestBTCPrice}));
 app.get('/tracker',(req,res)=>res.json(trackerData));
-app.post('/tracker',(req,res)=>{
-  const{wins,losses,skips,history}=req.body;
-  if(typeof wins==='number')trackerData.wins=wins;
-  if(typeof losses==='number')trackerData.losses=losses;
-  if(typeof skips==='number')trackerData.skips=skips;
-  if(Array.isArray(history))trackerData.history=history.slice(-50);
-  res.json({ok:true});
-});
 
 connectRTDS();
 const PORT=process.env.PORT||3001;
