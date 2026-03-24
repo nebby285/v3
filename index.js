@@ -357,13 +357,15 @@ async function updateMarket() {
     const yesTokenId=ids[0], noTokenId=ids[1];
     const endSec=wts+300;
     resolveLastDecision(wts);
-    const startPrice=await fetchPriceToBeat(wts)||latestBTCPrice;
+    // Use the live Chainlink price we're already receiving as price to beat
+    // This is EXACTLY what Polymarket uses — same feed, captured at window open
+    // Fall back to Binance candle only if Chainlink isn't available yet
+    const startPrice = latestBTCPrice || await fetchPriceToBeat(wts);
     currentMarket={slug,wts,yesTokenId,noTokenId,startPrice,endSec};
-    console.log('[MARKET] loaded startPrice:',startPrice,'endSec:',endSec);
+    console.log('[MARKET] loaded startPrice:',startPrice,'(Chainlink live) endSec:',endSec);
     if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
     broadcast({type:'market',market:currentMarket,odds:latestOdds});
     connectClobWS();
-    // Fire engine immediately after new market loads
     setTimeout(runEngine, 3000);
   }catch(e){console.error('[MARKET]',e.message);}
 }
