@@ -199,12 +199,10 @@ function runEngine() {
   const quality = Math.max(0, Math.min(1, (conf + timeFactor) / 2));
 
   let decision = 'NO TRADE', reason = '';
-  if (conf < 0.40) {
+  // Only NO TRADE if delta is genuinely flat (within ±0.002%)
+  if (Math.abs(delta) < 0.002) {
     decision = 'NO TRADE';
-    reason = `confidence too low (${Math.round(conf*100)}%) — delta ${delta.toFixed(3)}%`;
-  } else if (edge < 1.5) {
-    decision = 'NO TRADE';
-    reason = `edge too small (${edge.toFixed(1)})`;
+    reason = `delta too flat (${delta.toFixed(4)}%) — no clear direction`;
   } else if (bull > bear) {
     decision = 'BUY UP';
     reason = `delta +${delta.toFixed(3)}% | bull ${bull.toFixed(1)} vs bear ${bear.toFixed(1)} | conf ${Math.round(conf*100)}%`;
