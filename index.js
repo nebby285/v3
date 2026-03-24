@@ -191,9 +191,18 @@ function runEngine() {
 
   const total = bull + bear;
   const edge = Math.abs(bull - bear);
-  // Time factor: 0 at 60s, 1.0 at 3min — confidence grows as window progresses
-  const conf = Math.max(0, Math.min(1, total > 0 ? edge / total : 0));
-  const quality = Math.max(0, Math.min(1, conf * 0.7 + Math.min(elapsed / 300, 1) * 0.3));
+  const absDelta = Math.abs(delta);
+  let conf;
+  if      (absDelta > 0.10) conf = 0.90;
+  else if (absDelta > 0.05) conf = 0.75;
+  else if (absDelta > 0.02) conf = 0.58;
+  else if (absDelta > 0.005) conf = 0.40;
+  else                       conf = 0.15;
+  const oddsAligned = (bull > bear && yp > 0.55) || (bear > bull && np > 0.55);
+  if (oddsAligned) conf = Math.min(1, conf + 0.08);
+  if (elapsed > 200) conf = Math.min(1, conf + 0.05);
+  conf = Math.max(0, Math.min(1, conf));
+  const quality = Math.max(0, Math.min(1, conf * 0.75 + (Math.min(elapsed, 240) / 240) * 0.25));
 
   let decision = 'NO TRADE', reason = '';
   // Only NO TRADE if delta is genuinely flat (within ±0.002%)
