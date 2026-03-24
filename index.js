@@ -383,6 +383,13 @@ wss.on('connection',(ws)=>{
 });
 
 // ── REST ──────────────────────────────────────────────────────────────────────
+app.get('/candles', async (req,res)=>{
+  try{
+    const r=await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',{signal:AbortSignal.timeout(6000)});
+    const d=await r.json();
+    res.json(d);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/health',(req,res)=>res.json({ok:true,market:currentMarket?.slug,btc:latestBTCPrice,locked:lockedDecision?.decision||null}));
 app.get('/tracker',(req,res)=>res.json(trackerData));
 app.post('/tracker',(req,res)=>{
