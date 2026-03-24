@@ -129,6 +129,8 @@ async function updateMarket() {
       const idx = trackerData.history.findIndex(h => h.window === lockedDecision.wts);
       if (idx >= 0) trackerData.history[idx].result = result;
       lockedDecision.resolved = true;
+      const won2 = decision === 'NO TRADE' ? null : (decision === 'BUY UP' ? latestBTCPrice >= startPrice : latestBTCPrice < startPrice);
+      resolvePaperTrade(lockedDecision.wts, won2);
       console.log('[TRACKER]', decision, '→', result, `W:${trackerData.wins} L:${trackerData.losses}`);
       broadcast({ type: 'tracker', tracker: trackerData });
     }
@@ -339,6 +341,8 @@ async function runEngine() {
 
   lockedDecision = { wts: currentMarket.wts, decision, reason, bull, bear, conf, quality, edge, startPrice: sp, lockedAt: Date.now(), lockedAtElapsed: elapsed, resolved: false };
   broadcast({ type: 'decision', decision: lockedDecision });
+  // Auto paper trade
+  paperTrade(decision, latestOdds);
 
   const time = new Date(currentMarket.wts * 1000).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York' });
   trackerData.history = trackerData.history.filter(h => h.window !== currentMarket.wts);
@@ -365,6 +369,62 @@ wss.on('connection', (ws) => {
   ws.on('error', () => clients.delete(ws));
 });
 
+// ── PAPER TRADING ─────────────────────────────────────────────
+const ADMIN_PASSWORD = '5588';
+const PAPER_START = 100;
+let paperData = {
+  balance: 100,
+  startBalance: 100,
+  betSize: 10,
+  trades: [],
+  totalInvested: 0,
+  totalReturned: 0,
+};
+// Auto paper trade when decision locks
+function paperTrade(decision, odds) {
+  if (!decision || decision === 'NO TRADE' || !odds) return;
+  const betSize = paperData.betSize;
+  if (paperData.balance < betSize) return;
+  const isUp = decision === 'BUY UP';
+  const tokenPrice = isUp ? odds.yes : odds.no;
+  if (!tokenPrice || tokenPrice <= 0) return;
+  const shares = betSize / tokenPrice;
+  const potentialPayout = shares * 1.0;
+  paperData.balance -= betSize;
+  paperData.totalInvested += betSize;
+  const trade = {
+    id: Date.now(),
+    time: new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York'}),
+    wts: currentMarket?.wts,
+    decision,
+    betSize,
+    tokenPrice: parseFloat(tokenPrice.toFixed(4)),
+    shares: parseFloat(shares.toFixed(4)),
+    potentialPayout: parseFloat(potentialPayout.toFixed(2)),
+    result: 'PENDING',
+    pnl: 0,
+  };
+  paperData.trades.unshift(trade);
+  if (paperData.trades.length > 50) paperData.trades.pop();
+  console.log(`[PAPER] ${decision} $${betSize} @ ¢${Math.round(tokenPrice*100)} = ${shares.toFixed(2)} shares`);
+}
+// Resolve paper trade when window closes
+function resolvePaperTrade(wts, won) {
+  const trade = paperData.trades.find(t => t.wts === wts && t.result === 'PENDING');
+  if (!trade) return;
+  if (won === null) { trade.result = 'SKIP'; return; }
+  if (won) {
+    trade.result = 'WIN';
+    trade.pnl = parseFloat((trade.potentialPayout - trade.betSize).toFixed(2));
+    paperData.balance += trade.potentialPayout;
+    paperData.totalReturned += trade.potentialPayout;
+  } else {
+    trade.result = 'LOSS';
+    trade.pnl = -trade.betSize;
+  }
+  console.log(`[PAPER] resolved ${trade.decision} → ${trade.result} pnl:$${trade.pnl} balance:$${paperData.balance.toFixed(2)}`);
+}
+
 // ── REST ──────────────────────────────────────────────────────
 app.get('/candles', async (req, res) => {
   try {
@@ -374,6 +434,45 @@ app.get('/candles', async (req, res) => {
 });
 app.get('/tracker', (req, res) => res.json(trackerData));
 app.get('/health',  (req, res) => res.json({ ok: true, market: currentMarket?.slug, btc: latestBTCPrice, decision: lockedDecision?.decision || null }));
+
+// Admin auth
+app.post('/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASSWORD) res.json({ ok: true, token: Buffer.from(ADMIN_PASSWORD).toString('base64') });
+  else res.status(401).json({ ok: false, error: 'Wrong password' });
+});
+
+function adminAuth(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (token === Buffer.from(ADMIN_PASSWORD).toString('base64')) return next();
+  res.status(401).json({ ok: false, error: 'Unauthorized' });
+}
+
+// Admin endpoints
+app.get('/admin/stats', adminAuth, (req, res) => {
+  const w = trackerData.wins, l = trackerData.losses, t = w + l;
+  const roi = ((paperData.balance - paperData.startBalance) / paperData.startBalance * 100).toFixed(2);
+  res.json({
+    liveUsers: clients.size,
+    signal: { wins: w, losses: l, skips: trackerData.skips, winRate: t > 0 ? Math.round(w/t*100) : 0 },
+    market: currentMarket ? { slug: currentMarket.slug, startPrice: currentMarket.startPrice, endSec: currentMarket.endSec } : null,
+    btcPrice: latestBTCPrice,
+    odds: latestOdds,
+    decision: lockedDecision,
+    paper: { ...paperData, roi: parseFloat(roi) },
+  });
+});
+
+app.post('/admin/paper/reset', adminAuth, (req, res) => {
+  const { startBalance, betSize } = req.body;
+  paperData = { balance: startBalance||100, startBalance: startBalance||100, betSize: betSize||10, trades: [], totalInvested: 0, totalReturned: 0 };
+  res.json({ ok: true });
+});
+
+app.post('/admin/paper/betsize', adminAuth, (req, res) => {
+  paperData.betSize = Math.max(1, Math.min(paperData.balance, req.body.betSize || 10));
+  res.json({ ok: true, betSize: paperData.betSize });
+});
 
 connectRTDS();
 const PORT = process.env.PORT || 3001;
