@@ -15,7 +15,7 @@ let latestOdds     = { yes: 0.5, no: 0.5 };
 let latestBTCPrice = null;
 let clients        = new Set();
 let lockedDecision = null;
-let trackerData    = { wins: 0, losses: 0, skips: 0, history: [] };
+let trackerData    = {"wins":75,"losses":39,"skips":5,"history":[{"time":"08:05 AM","decision":"BUY DOWN","result":"LOSS","window":1774353900},{"time":"08:10 AM","decision":"BUY DOWN","result":"WIN","window":1774354200},{"time":"08:15 AM","decision":"BUY DOWN","result":"WIN","window":1774354500},{"time":"08:20 AM","decision":"BUY UP","result":"LOSS","window":1774354800},{"time":"08:25 AM","decision":"BUY UP","result":"WIN","window":1774355100},{"time":"08:30 AM","decision":"BUY DOWN","result":"WIN","window":1774355400},{"time":"08:35 AM","decision":"BUY UP","result":"WIN","window":1774355700},{"time":"08:40 AM","decision":"BUY UP","result":"WIN","window":1774356000},{"time":"08:45 AM","decision":"BUY UP","result":"LOSS","window":1774356300},{"time":"08:50 AM","decision":"BUY UP","result":"WIN","window":1774356600},{"time":"08:55 AM","decision":"BUY DOWN","result":"WIN","window":1774356900},{"time":"09:00 AM","decision":"BUY UP","result":"WIN","window":1774357200},{"time":"09:05 AM","decision":"BUY UP","result":"LOSS","window":1774357500},{"time":"09:10 AM","decision":"BUY UP","result":"WIN","window":1774357800},{"time":"09:15 AM","decision":"BUY DOWN","result":"WIN","window":1774358100},{"time":"09:20 AM","decision":"BUY DOWN","result":"LOSS","window":1774358400},{"time":"09:25 AM","decision":"BUY UP","result":"LOSS","window":1774358700},{"time":"09:30 AM","decision":"BUY UP","result":"WIN","window":1774359000},{"time":"09:35 AM","decision":"BUY DOWN","result":"WIN","window":1774359300},{"time":"09:40 AM","decision":"BUY DOWN","result":"WIN","window":1774359600}]};
 
 // Chainlink price buffer — stores last 90s of prices with timestamps
 // So we can look up exact price at any window boundary
@@ -158,10 +158,22 @@ let lastChainlinkUpdate = Date.now();
 // (already set in RTDS handler — we'll update it there too)
 
 async function fetchCandles() {
-  try {
-    const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30', { signal: AbortSignal.timeout(6000) });
-    return (await r.json()).map(c => ({ open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5] }));
-  } catch(e) { console.warn('[CANDLES]', e.message); return null; }
+  const sources = [
+    'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',
+    'https://api.binance.us/api/v3/klines?symbol=BTCUSD&interval=1m&limit=30',
+    'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=30',
+  ];
+  for (const url of sources) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!Array.isArray(data) || !data.length) throw new Error('empty');
+      return data.map(c => ({ open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5] }));
+    } catch(e) { console.warn('[CANDLES] failed:', url, e.message); }
+  }
+  console.error('[CANDLES] all sources failed');
+  return null;
 }
 function ema(v, p) { const k=2/(p+1); let e=v[0]; for(let i=1;i<v.length;i++) e=v[i]*k+e*(1-k); return e; }
 function rsi(c, p=14) { if(c.length<p+1) return 50; let g=0,l=0; for(let i=c.length-p;i<c.length;i++){const d=c[i]-c[i-1];d>0?g+=d:l-=d;} const ag=g/p,al=l/p; if(!al) return 100; return 100-(100/(1+ag/al)); }
