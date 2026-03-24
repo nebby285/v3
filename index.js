@@ -78,6 +78,7 @@ function connectRTDS() {
       const msg = JSON.parse(raw.toString());
       if (msg.topic === 'crypto_prices_chainlink' && msg.payload?.value) {
         latestBTCPrice = parseFloat(msg.payload.value);
+        lastChainlinkUpdate = Date.now();
         const now = Date.now();
         chainlinkBuffer.push({ ts: now, price: latestBTCPrice });
         if (chainlinkBuffer.length > 200) chainlinkBuffer.shift();
@@ -145,84 +146,188 @@ async function updateMarket() {
     }
     broadcast({ type: 'market', market: currentMarket, odds: latestOdds });
     connectClobWS();
-    setTimeout(runEngine, 3000);
+    setTimeout(() => runEngine(), 3000);
   } catch(e) { console.error('[MARKET]', e.message); }
 }
 setInterval(updateMarket, 15000);
 updateMarket();
 
 // ── ENGINE ────────────────────────────────────────────────────
-function runEngine() {
+// Track Chainlink update frequency
+let lastChainlinkUpdate = Date.now();
+// (already set in RTDS handler — we'll update it there too)
+
+async function fetchCandles() {
+  try {
+    const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30', { signal: AbortSignal.timeout(6000) });
+    return (await r.json()).map(c => ({ open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5] }));
+  } catch(e) { console.warn('[CANDLES]', e.message); return null; }
+}
+function ema(v, p) { const k=2/(p+1); let e=v[0]; for(let i=1;i<v.length;i++) e=v[i]*k+e*(1-k); return e; }
+function rsi(c, p=14) { if(c.length<p+1) return 50; let g=0,l=0; for(let i=c.length-p;i<c.length;i++){const d=c[i]-c[i-1];d>0?g+=d:l-=d;} const ag=g/p,al=l/p; if(!al) return 100; return 100-(100/(1+ag/al)); }
+function avg(a) { return a.reduce((s,x)=>s+x,0)/a.length; }
+
+async function runEngine() {
   if (!currentMarket || !latestBTCPrice || !currentMarket.startPrice) return;
   const secsLeft = Math.max(0, currentMarket.endSec - Math.floor(Date.now()/1000));
   if (secsLeft <= 0) return;
   const elapsed = 300 - secsLeft;
 
-  // Wait 60s minimum before deciding
-  if (elapsed < 60) {
-    broadcast({ type: 'engine_waiting', elapsed });
-    return;
-  }
-  // Already locked for this window — re-broadcast
+  // Wait 60s minimum
+  if (elapsed < 60) { broadcast({ type: 'engine_waiting', elapsed }); return; }
+  // Already locked — re-broadcast
   if (lockedDecision && lockedDecision.wts === currentMarket.wts && !lockedDecision.resolved) {
-    broadcast({ type: 'decision', decision: lockedDecision });
-    return;
+    broadcast({ type: 'decision', decision: lockedDecision }); return;
   }
 
   const cp = latestBTCPrice, sp = currentMarket.startPrice;
   const yp = latestOdds.yes, np = latestOdds.no;
   const delta = ((cp - sp) / sp) * 100;
+  const absDelta = Math.abs(delta);
+
+  // Fetch candles for technical signals
+  const candles = await fetchCandles();
 
   let bull = 0, bear = 0;
-  // Window delta (weight 8) — dominant signal
-  if      (delta >  0.10) bull += 8;
-  else if (delta >  0.05) bull += 6.4;
-  else if (delta >  0.02) bull += 4.8;
-  else if (delta >  0.005) bull += 2.4;
-  else if (delta < -0.10) bear += 8;
-  else if (delta < -0.05) bear += 6.4;
-  else if (delta < -0.02) bear += 4.8;
-  else if (delta < -0.005) bear += 2.4;
-  // Market odds (weight 2)
-  if      (yp > 0.70) bull += 2;
-  else if (yp > 0.55) bull += 1.2;
-  else if (np > 0.70) bear += 2;
-  else if (np > 0.55) bear += 1.2;
+  let signals = [];
 
-  const total = bull + bear;
-  const edge = Math.abs(bull - bear);
-  const absDelta = Math.abs(delta);
+  // ── SIGNAL 1: Window Delta (weight 8) ─────────────────────
+  if      (delta >  0.10) { bull += 8;   signals.push('delta strongly UP'); }
+  else if (delta >  0.05) { bull += 6.4; signals.push('delta UP'); }
+  else if (delta >  0.02) { bull += 4.8; signals.push('delta slightly UP'); }
+  else if (delta >  0.005){ bull += 2.4; signals.push('delta barely UP'); }
+  else if (delta < -0.10) { bear += 8;   signals.push('delta strongly DOWN'); }
+  else if (delta < -0.05) { bear += 6.4; signals.push('delta DOWN'); }
+  else if (delta < -0.02) { bear += 4.8; signals.push('delta slightly DOWN'); }
+  else if (delta < -0.005){ bear += 2.4; signals.push('delta barely DOWN'); }
+
+  // ── SIGNAL 2: Market Odds (weight 2) ──────────────────────
+  if      (yp > 0.70) { bull += 2;   signals.push(`YES bid ${Math.round(yp*100)}¢`); }
+  else if (yp > 0.55) { bull += 1.2; signals.push(`YES lean ${Math.round(yp*100)}¢`); }
+  else if (np > 0.70) { bear += 2;   signals.push(`NO bid ${Math.round(np*100)}¢`); }
+  else if (np > 0.55) { bear += 1.2; signals.push(`NO lean ${Math.round(np*100)}¢`); }
+
+  // ── CANDLE SIGNALS ─────────────────────────────────────────
+  let confMod = 0;
+  if (candles && candles.length >= 5) {
+    // SIGNAL 3: 1m Momentum (weight 2.5)
+    if (candles.length >= 3) {
+      const m1 = candles[candles.length-1].close - candles[candles.length-1].open;
+      const m2 = candles[candles.length-2].close - candles[candles.length-2].open;
+      if (m1>0 && m2>0) { bull += 2.5; signals.push('2 bull candles'); }
+      else if (m1<0 && m2<0) { bear += 2.5; signals.push('2 bear candles'); }
+      else if (m1>0) { bull += 1.25; signals.push('last candle bullish'); }
+      else if (m1<0) { bear += 1.25; signals.push('last candle bearish'); }
+    }
+    // SIGNAL 4: 3m Trend (weight 2)
+    if (candles.length >= 4) {
+      const sl = candles.slice(-3);
+      const bc = sl.filter(c=>c.close>c.open).length, rc = sl.filter(c=>c.close<c.open).length;
+      if (bc===3) { bull += 2; signals.push('3/3 bull candles'); }
+      else if (rc===3) { bear += 2; signals.push('3/3 bear candles'); }
+      else if (bc===2) { bull += 1; signals.push('2/3 bull'); }
+      else if (rc===2) { bear += 1; signals.push('2/3 bear'); }
+    }
+    // SIGNAL 5: EMA 9/21 (weight 1)
+    if (candles.length >= 22) {
+      const cl = candles.map(c=>c.close);
+      const e9 = ema(cl.slice(-9),9), e21 = ema(cl.slice(-21),21);
+      const g = ((e9-e21)/e21)*100;
+      if (g > 0.02) { bull += 1; signals.push(`EMA9>EMA21 +${g.toFixed(3)}%`); }
+      else if (g < -0.02) { bear += 1; signals.push(`EMA9<EMA21 ${g.toFixed(3)}%`); }
+    }
+    // SIGNAL 6: RSI (weight 1.5)
+    if (candles.length >= 16) {
+      const r = rsi(candles.map(c=>c.close), 14);
+      if (r < 25) { bull += 1.5; signals.push(`RSI oversold ${r.toFixed(0)}`); }
+      else if (r < 35) { bull += 0.75; signals.push(`RSI low ${r.toFixed(0)}`); }
+      else if (r > 75) { bear += 1.5; signals.push(`RSI overbought ${r.toFixed(0)}`); }
+      else if (r > 65) { bear += 0.75; signals.push(`RSI high ${r.toFixed(0)}`); }
+    }
+    // SIGNAL 7: Volume spike (confidence modifier)
+    if (candles.length >= 7) {
+      const recentVol = avg(candles.slice(-3).map(c=>c.volume));
+      const priorVol  = avg(candles.slice(-6,-3).map(c=>c.volume));
+      const ratio = recentVol / priorVol;
+      if (ratio > 1.5) { confMod += 0.10; signals.push(`vol surge ${ratio.toFixed(1)}x`); }
+      else if (ratio > 1.2) { confMod += 0.05; signals.push('vol elevated'); }
+      else if (ratio < 0.6) { confMod -= 0.08; signals.push('vol dry'); }
+    }
+    // SIGNAL 8: Wick rejection (weight 1.5)
+    if (candles.length >= 2) {
+      const l = candles[candles.length-1];
+      const body = Math.abs(l.close-l.open), range = l.high-l.low;
+      if (range > 0) {
+        const uw = (l.high - Math.max(l.open,l.close)) / range;
+        const lw = (Math.min(l.open,l.close) - l.low) / range;
+        if (uw > 0.5 && body/range < 0.3) { bear += 1.5; signals.push(`bear wick ${Math.round(uw*100)}%`); }
+        else if (lw > 0.5 && body/range < 0.3) { bull += 1.5; signals.push(`bull wick ${Math.round(lw*100)}%`); }
+      }
+    }
+    // SIGNAL 9: Choppiness penalty
+    let dirChanges = 0;
+    const sl5 = candles.slice(-5);
+    for (let i=1;i<sl5.length;i++) {
+      const p=sl5[i-1].close-sl5[i-1].open, q=sl5[i].close-sl5[i].open;
+      if ((p>0&&q<0)||(p<0&&q>0)) dirChanges++;
+    }
+    if (dirChanges >= 3) { confMod -= 0.12; signals.push(`choppy ${dirChanges}/4`); }
+  } else {
+    signals.push('no candles — delta+odds only');
+  }
+
+  // ── SIGNAL 10: Chainlink update frequency ─────────────────
+  const chainlinkAge = (Date.now() - lastChainlinkUpdate) / 1000;
+  if (chainlinkAge > 25) {
+    confMod -= 0.15;
+    signals.push(`Chainlink stale ${chainlinkAge.toFixed(0)}s — low vol`);
+  } else if (chainlinkAge > 12) {
+    confMod -= 0.07;
+    signals.push(`Chainlink slow ${chainlinkAge.toFixed(0)}s`);
+  }
+
+  // ── CONFIDENCE ─────────────────────────────────────────────
   let conf;
   if      (absDelta > 0.10) conf = 0.90;
   else if (absDelta > 0.05) conf = 0.75;
   else if (absDelta > 0.02) conf = 0.58;
   else if (absDelta > 0.005) conf = 0.40;
   else                       conf = 0.15;
-  const oddsAligned = (bull > bear && yp > 0.55) || (bear > bull && np > 0.55);
-  if (oddsAligned) conf = Math.min(1, conf + 0.08);
-  if (elapsed > 200) conf = Math.min(1, conf + 0.05);
-  conf = Math.max(0, Math.min(1, conf));
-  const quality = Math.max(0, Math.min(1, conf * 0.75 + (Math.min(elapsed, 240) / 240) * 0.25));
 
+  // Candle agreement boosts/reduces confidence
+  const total = bull + bear;
+  const signalAlignment = total > 0 ? (bull > bear ? bull/total : bear/total) : 0.5;
+  conf = conf * 0.6 + signalAlignment * 0.4;
+
+  // Apply modifiers
+  conf = Math.max(0, Math.min(1, conf + confMod));
+
+  // Odds aligned = small boost
+  const oddsAligned = (bull > bear && yp > 0.55) || (bear > bull && np > 0.55);
+  if (oddsAligned) conf = Math.min(1, conf + 0.05);
+  if (elapsed > 200) conf = Math.min(1, conf + 0.04);
+
+  const quality = Math.max(0, Math.min(1, conf * 0.75 + (Math.min(elapsed,240)/240) * 0.25));
+  const edge = Math.abs(bull - bear);
+
+  // ── DECISION ───────────────────────────────────────────────
   let decision = 'NO TRADE', reason = '';
-  // Only NO TRADE if delta is genuinely flat (within ±0.002%)
-  if (Math.abs(delta) < 0.002) {
+  if (absDelta < 0.002) {
     decision = 'NO TRADE';
-    reason = `delta too flat (${delta.toFixed(4)}%) — no clear direction`;
+    reason = `delta flat (${delta.toFixed(4)}%)`;
   } else if (bull > bear) {
     decision = 'BUY UP';
-    reason = `delta +${delta.toFixed(3)}% | bull ${bull.toFixed(1)} vs bear ${bear.toFixed(1)} | conf ${Math.round(conf*100)}%`;
+    reason = signals.slice(0,3).join(' · ');
   } else {
     decision = 'BUY DOWN';
-    reason = `delta ${delta.toFixed(3)}% | bear ${bear.toFixed(1)} vs bull ${bull.toFixed(1)} | conf ${Math.round(conf*100)}%`;
+    reason = signals.slice(0,3).join(' · ');
   }
 
-  console.log('[ENGINE]', decision, `| conf:${Math.round(conf*100)}% edge:${edge.toFixed(1)} delta:${delta.toFixed(3)}% elapsed:${elapsed}s`);
+  console.log('[ENGINE]', decision, `conf:${Math.round(conf*100)}% quality:${Math.round(quality*100)}% delta:${delta.toFixed(3)}% elapsed:${elapsed}s | ${signals.join(', ')}`);
 
   lockedDecision = { wts: currentMarket.wts, decision, reason, bull, bear, conf, quality, edge, startPrice: sp, lockedAt: Date.now(), lockedAtElapsed: elapsed, resolved: false };
   broadcast({ type: 'decision', decision: lockedDecision });
 
-  // Add PENDING to tracker history
   const time = new Date(currentMarket.wts * 1000).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York' });
   trackerData.history = trackerData.history.filter(h => h.window !== currentMarket.wts);
   trackerData.history.push({ time, decision, result: 'PENDING', window: currentMarket.wts });
@@ -231,8 +336,8 @@ function runEngine() {
 }
 
 // Run engine every 10s
-setInterval(() => {
-  if (!lockedDecision || lockedDecision.wts !== getWindowTs()) runEngine();
+setInterval(async () => {
+  if (!lockedDecision || lockedDecision.wts !== getWindowTs()) await runEngine();
   else broadcast({ type: 'decision', decision: lockedDecision });
 }, 10000);
 
