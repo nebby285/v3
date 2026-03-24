@@ -78,10 +78,6 @@ function connectClobWS(){
   clobWS.on('error',(e)=>console.error('[CLOB]',e.message));
 }
 
-// Rolling buffer of last 60 seconds of Chainlink prices with timestamps
-// So we can look back and find the exact price at any window boundary
-const chainlinkBuffer = []; // [{ts, price}]
-
 // RTDS WebSocket (Chainlink BTC price)
 let rtdsWS=null;
 function connectRTDS(){
@@ -96,32 +92,15 @@ function connectRTDS(){
       const msg=JSON.parse(raw.toString());
       if(msg.topic==='crypto_prices_chainlink'&&msg.payload?.value){
         latestBTCPrice=parseFloat(msg.payload.value);
-        // Store in buffer with timestamp for exact historical lookup
         const now=Date.now();
         chainlinkBuffer.push({ts:now,price:latestBTCPrice});
-        if(chainlinkBuffer.length>180) chainlinkBuffer.shift(); // keep ~90s at 2/sec
-        // Add to buffer with current timestamp
-        const now=Date.now();
-        chainlinkBuffer.push({ts:now, price:latestBTCPrice});
-        // Keep only last 90 seconds
-        const cutoff=now-90000;
-        while(chainlinkBuffer.length&&chainlinkBuffer[0].ts<cutoff) chainlinkBuffer.shift();
+        if(chainlinkBuffer.length>180) chainlinkBuffer.shift();
         broadcast({type:'btc_price',price:latestBTCPrice});
       }
     }catch(e){}
   });
   rtdsWS.on('close',()=>{clearInterval(rtdsWS._ping);setTimeout(connectRTDS,3000);});
   rtdsWS.on('error',(e)=>console.error('[RTDS]',e.message));
-}
-
-// Get the Chainlink price closest to a given unix timestamp
-function getChainlinkAtTime(targetMs) {
-  if(!chainlinkBuffer.length) return latestBTCPrice;
-  let best = chainlinkBuffer[0];
-  for(const entry of chainlinkBuffer) {
-    if(Math.abs(entry.ts - targetMs) < Math.abs(best.ts - targetMs)) best = entry;
-  }
-  return best.price;
 }
 
 // Market loop
