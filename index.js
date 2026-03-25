@@ -3,397 +3,477 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import cors from 'cors';
 
-const app    = express();
+const app = express();
 const server = createServer(app);
-const wss    = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server });
 app.use(cors());
 app.use(express.json());
 
+// ── STATE ─────────────────────────────────────────────────────
 let currentMarket  = null;
 let latestOdds     = { yes: 0.5, no: 0.5 };
 let latestBTCPrice = null;
 let clients        = new Set();
 let lockedDecision = null;
-let trackerData    = { wins: 0, losses: 0, skips: 0, history: [] };
+let trackerData    = {"wins":106,"losses":54,"skips":5,"history":[{"time":"12:05 PM","decision":"BUY DOWN","result":"LOSS","window":1774368300},{"time":"12:10 PM","decision":"BUY UP","result":"WIN","window":1774368600},{"time":"12:15 PM","decision":"BUY DOWN","result":"WIN","window":1774368900},{"time":"12:20 PM","decision":"BUY DOWN","result":"WIN","window":1774369200},{"time":"12:25 PM","decision":"BUY DOWN","result":"WIN","window":1774369500},{"time":"12:30 PM","decision":"BUY DOWN","result":"WIN","window":1774369800},{"time":"12:35 PM","decision":"BUY DOWN","result":"WIN","window":1774370100},{"time":"12:40 PM","decision":"BUY DOWN","result":"LOSS","window":1774370400},{"time":"12:45 PM","decision":"BUY DOWN","result":"WIN","window":1774370700},{"time":"12:50 PM","decision":"BUY UP","result":"WIN","window":1774371000},{"time":"12:55 PM","decision":"BUY DOWN","result":"WIN","window":1774371300},{"time":"01:00 PM","decision":"BUY UP","result":"LOSS","window":1774371600},{"time":"01:05 PM","decision":"BUY DOWN","result":"WIN","window":1774371900},{"time":"01:10 PM","decision":"BUY UP","result":"WIN","window":1774372200},{"time":"01:15 PM","decision":"BUY UP","result":"LOSS","window":1774372500},{"time":"01:20 PM","decision":"BUY UP","result":"WIN","window":1774372800},{"time":"02:40 PM","decision":"BUY DOWN","result":"WIN","window":1774377600,"conf":78},{"time":"02:45 PM","decision":"BUY UP","result":"LOSS","window":1774377900,"conf":61},{"time":"02:50 PM","decision":"BUY UP","result":"WIN","window":1774378200,"conf":84},{"time":"02:55 PM","decision":"BUY DOWN","result":"WIN","window":1774378500,"conf":72}]};
 
-function getWindowTs(offset = 0) {
-  const sec = Math.floor(Date.now() / 1000);
-  return (sec - (sec % 300)) + offset * 300;
+// Chainlink price buffer — stores last 90s of prices with timestamps
+// So we can look up exact price at any window boundary
+const chainlinkBuffer = [];
+function getPriceAtTime(targetMs) {
+  if (!chainlinkBuffer.length) return latestBTCPrice;
+  let best = chainlinkBuffer[0];
+  for (const e of chainlinkBuffer) {
+    if (Math.abs(e.ts - targetMs) < Math.abs(best.ts - targetMs)) best = e;
+  }
+  return best.price;
 }
 
+// ── HELPERS ───────────────────────────────────────────────────
+function getWindowTs() { const s = Math.floor(Date.now()/1000); return s - (s % 300); }
 function broadcast(msg) {
   const s = JSON.stringify(msg);
   for (const c of clients) if (c.readyState === WebSocket.OPEN) c.send(s);
 }
 
-// ── CANDLES ───────────────────────────────────────────────────────────────────
-async function fetchCandles(limit = 30) {
-  try {
-    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${limit}`, { signal: AbortSignal.timeout(6000) });
-    return (await r.json()).map(c => ({
-      ts: c[0]/1000, open: parseFloat(c[1]), high: parseFloat(c[2]),
-      low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[5])
-    }));
-  } catch(e) {
-    console.error('[CANDLES]', e.message);
-    return null;
-  }
-}
-
-// ── PRICE TO BEAT ─────────────────────────────────────────────────────────────
-async function fetchPriceToBeat(windowTs) {
-  try {
-    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=${windowTs*1000}&endTime=${(windowTs+180)*1000}&limit=3`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
-    const d = await r.json();
-    if (Array.isArray(d) && d.length > 0) {
-      const target = windowTs * 1000;
-      let best = d[0];
-      for (const c of d) if (Math.abs(c[0]-target) < Math.abs(best[0]-target)) best = c;
-      return parseFloat(best[1]);
-    }
-  } catch(e) { console.error('[PTB]', e.message); }
-  return null;
-}
-
-// ── MATH ──────────────────────────────────────────────────────────────────────
-function ema(v, p) { const k=2/(p+1); let e=v[0]; for(let i=1;i<v.length;i++) e=v[i]*k+e*(1-k); return e; }
-function rsi(c, p=14) { if(c.length<p+1) return 50; let g=0,l=0; for(let i=c.length-p;i<c.length;i++){const d=c[i]-c[i-1];d>0?g+=d:l-=d;} const ag=g/p,al=l/p; if(!al) return 100; return 100-(100/(1+ag/al)); }
-function avg(a) { return a.reduce((x,y)=>x+y,0)/a.length; }
-function clamp(v,mn,mx) { return Math.max(mn,Math.min(mx,v)); }
-
-// ── SIGNALS ───────────────────────────────────────────────────────────────────
-function sigWindowDelta(cp, sp) {
-  if(!cp||!sp) return {bull:0,bear:0,note:'no data'};
-  const d=((cp-sp)/sp)*100;
-  let bull=0,bear=0;
-  if(d>0.10)bull=1;else if(d>0.05)bull=0.8;else if(d>0.02)bull=0.6;else if(d>0.005)bull=0.3;
-  else if(d<-0.10)bear=1;else if(d<-0.05)bear=0.8;else if(d<-0.02)bear=0.6;else if(d<-0.005)bear=0.3;
-  return {bull,bear,deltaPct:d.toFixed(4),note:d.toFixed(4)+'% vs PTB'};
-}
-function sigMomentum(c) {
-  if(c.length<3) return {bull:0,bear:0,note:'insufficient'};
-  const m1=c[c.length-1].close-c[c.length-1].open, m2=c[c.length-2].close-c[c.length-2].open;
-  if(m1>0&&m2>0) return {bull:1,bear:0,note:'2 bull candles'};
-  if(m1<0&&m2<0) return {bull:0,bear:1,note:'2 bear candles'};
-  if(m1>0) return {bull:0.5,bear:0,note:'last bullish'};
-  if(m1<0) return {bull:0,bear:0.5,note:'last bearish'};
-  return {bull:0,bear:0,note:'flat'};
-}
-function sigTrend3(c) {
-  if(c.length<4) return {bull:0,bear:0,note:'insufficient'};
-  const s=c.slice(-3),bc=s.filter(x=>x.close>x.open).length,rc=s.filter(x=>x.close<x.open).length;
-  if(bc===3) return {bull:1,bear:0,note:'3/3 bull'};
-  if(rc===3) return {bull:0,bear:1,note:'3/3 bear'};
-  if(bc===2) return {bull:0.5,bear:0,note:'2/3 bull'};
-  if(rc===2) return {bull:0,bear:0.5,note:'2/3 bear'};
-  return {bull:0,bear:0,note:'mixed'};
-}
-function sigTrend5(c) {
-  if(c.length<6) return {bull:0,bear:0,note:'insufficient'};
-  const m=c[c.length-1].close-c[c.length-5].open, p=(m/c[c.length-5].open)*100;
-  if(p>0.08) return {bull:1,bear:0,note:'5m +'+p.toFixed(3)+'%'};
-  if(p>0.02) return {bull:0.6,bear:0,note:'5m +'+p.toFixed(3)+'%'};
-  if(p<-0.08) return {bull:0,bear:1,note:'5m '+p.toFixed(3)+'%'};
-  if(p<-0.02) return {bull:0,bear:0.6,note:'5m '+p.toFixed(3)+'%'};
-  return {bull:0,bear:0,note:'5m flat'};
-}
-function sigEMA(c) {
-  if(c.length<22) return {bull:0,bear:0,note:'insufficient'};
-  const cl=c.map(x=>x.close), e9=ema(cl.slice(-9),9), e21=ema(cl.slice(-21),21), g=((e9-e21)/e21)*100;
-  if(g>0.02) return {bull:1,bear:0,note:'EMA9>EMA21 +'+g.toFixed(3)+'%'};
-  if(g<-0.02) return {bull:0,bear:1,note:'EMA9<EMA21 '+g.toFixed(3)+'%'};
-  return {bull:0,bear:0,note:'EMA flat'};
-}
-function sigRSI(c) {
-  if(c.length<16) return {bull:0,bear:0,note:'insufficient'};
-  const r=rsi(c.map(x=>x.close),14);
-  if(r<25) return {bull:1,bear:0,note:'RSI oversold '+r.toFixed(0)};
-  if(r<35) return {bull:0.5,bear:0,note:'RSI low '+r.toFixed(0)};
-  if(r>75) return {bull:0,bear:1,note:'RSI overbought '+r.toFixed(0)};
-  if(r>65) return {bull:0,bear:0.5,note:'RSI high '+r.toFixed(0)};
-  return {bull:0,bear:0,note:'RSI '+r.toFixed(0)};
-}
-function sigVolume(c) {
-  if(c.length<7) return {mod:0,note:'insufficient'};
-  const ra=avg(c.slice(-3).map(x=>x.volume)), pa=avg(c.slice(-6,-3).map(x=>x.volume)), ratio=ra/pa;
-  if(ratio>1.5) return {mod:0.12,note:'vol surge '+ratio.toFixed(2)+'x'};
-  if(ratio>1.2) return {mod:0.06,note:'vol elevated'};
-  if(ratio<0.6) return {mod:-0.1,note:'vol dry'};
-  return {mod:0,note:'vol normal'};
-}
-function sigMarketOdds(yp, np) {
-  if(!yp||!np) return {bull:0,bear:0,note:'no odds'};
-  if(yp>0.70) return {bull:1,bear:0,note:'YES bid '+Math.round(yp*100)+'¢'};
-  if(yp>0.55) return {bull:0.6,bear:0,note:'YES lean '+Math.round(yp*100)+'¢'};
-  if(np>0.70) return {bull:0,bear:1,note:'NO bid '+Math.round(np*100)+'¢'};
-  if(np>0.55) return {bull:0,bear:0.6,note:'NO lean '+Math.round(np*100)+'¢'};
-  return {bull:0,bear:0,note:'market even'};
-}
-function sigWick(c) {
-  if(c.length<2) return {bull:0,bear:0,note:'insufficient'};
-  const l=c[c.length-1], body=Math.abs(l.close-l.open), range=l.high-l.low;
-  if(!range) return {bull:0,bear:0,note:'no range'};
-  const uw=(l.high-Math.max(l.open,l.close))/range, lw=(Math.min(l.open,l.close)-l.low)/range;
-  if(uw>0.5&&body/range<0.3) return {bull:0,bear:1,note:'bear wick '+Math.round(uw*100)+'%'};
-  if(lw>0.5&&body/range<0.3) return {bull:1,bear:0,note:'bull wick '+Math.round(lw*100)+'%'};
-  return {bull:0,bear:0,note:'normal candle'};
-}
-function sigMeanRev(c, cp) {
-  if(c.length<10||!cp) return {bull:0,bear:0,note:'insufficient'};
-  const m=avg(c.slice(-10).map(x=>x.close)), d=((cp-m)/m)*100;
-  if(d>0.15) return {bull:0,bear:0.8,note:'+'+d.toFixed(3)+'% above mean'};
-  if(d<-0.15) return {bull:0.8,bear:0,note:d.toFixed(3)+'% below mean'};
-  return {bull:0,bear:0,note:'near mean'};
-}
-
-const W = { windowDelta:8, momentum:2.5, trend3:2, trend5:1.5, ema:1, rsi:1.5, odds:2, wick:1.5, meanRev:1 };
-
-// ── ENGINE ────────────────────────────────────────────────────────────────────
-async function runEngine() {
-  if(!currentMarket || !latestBTCPrice || !currentMarket.startPrice) {
-    console.log('[ENGINE] waiting for data — market:', !!currentMarket, 'btc:', !!latestBTCPrice, 'sp:', currentMarket?.startPrice);
-    return;
-  }
-
-  const nowSec   = Math.floor(Date.now() / 1000);
-  const secsLeft = Math.max(0, currentMarket.endSec - nowSec);
-  const elapsed  = 300 - secsLeft;
-
-  // Already have a locked decision for this window — just re-broadcast it
-  if(lockedDecision && lockedDecision.wts === currentMarket.wts && !lockedDecision.resolved) {
-    broadcast({ type:'decision', decision:lockedDecision });
-    return;
-  }
-
-  if(secsLeft <= 0) { console.log('[ENGINE] window over'); return; }
-
-  console.log(`[ENGINE] firing at T+${elapsed}s`);
-
-  const candles = await fetchCandles(30);
-  if(!candles || candles.length < 5) { console.log('[ENGINE] candle fetch failed'); return; }
-
-  const cp=latestBTCPrice, sp=currentMarket.startPrice, yp=latestOdds.yes, np=latestOdds.no;
-
-  const s1=sigWindowDelta(cp,sp);
-  const s2=sigMomentum(candles);
-  const s3=sigTrend3(candles);
-  const s4=sigTrend5(candles);
-  const s5=sigEMA(candles);
-  const s6=sigRSI(candles);
-  const s7=sigVolume(candles);
-  const s8=sigMarketOdds(yp,np);
-  const s9=sigWick(candles);
-  const s10=sigMeanRev(candles,cp);
-
-  let bull=0, bear=0;
-  bull+=s1.bull*W.windowDelta; bear+=s1.bear*W.windowDelta;
-  bull+=s2.bull*W.momentum;    bear+=s2.bear*W.momentum;
-  bull+=s3.bull*W.trend3;      bear+=s3.bear*W.trend3;
-  bull+=s4.bull*W.trend5;      bear+=s4.bear*W.trend5;
-  bull+=s5.bull*W.ema;         bear+=s5.bear*W.ema;
-  bull+=s6.bull*W.rsi;         bear+=s6.bear*W.rsi;
-  bull+=s8.bull*W.odds;        bear+=s8.bear*W.odds;
-  bull+=s9.bull*W.wick;        bear+=s9.bear*W.wick;
-  bull+=s10.bull*W.meanRev;    bear+=s10.bear*W.meanRev;
-
-  const total=bull+bear, edge=Math.abs(bull-bear);
-  const maxS=Object.values(W).reduce((a,b)=>a+b,0);
-  let conf=total>0?edge/total:0;
-  conf+=(s7.mod||0);
-
-  // choppiness
-  let dc=0; const sl5=candles.slice(-5);
-  for(let i=1;i<sl5.length;i++){const p=sl5[i-1].close-sl5[i-1].open,q=sl5[i].close-sl5[i].open;if((p>0&&q<0)||(p<0&&q>0))dc++;}
-  conf-=(dc/4)*0.15;
-  conf=clamp(conf,0,1);
-
-  const strength=total/maxS, quality=clamp((strength+conf)/2,0,1);
-
-  // Timing confidence bonus
-  let timingNote='';
-  if(elapsed>=90&&elapsed<=180){conf=clamp(conf+0.1,0,1);timingNote='optimal timing';}
-  else if(elapsed<60){timingNote='early window';}
-  else{timingNote=elapsed+'s elapsed';}
-
-  // Token price estimate based on delta
-  const deltaPct=parseFloat(s1.deltaPct||'0');
-  const absDelta=Math.abs(deltaPct);
-  const correctDir=(bull>bear&&deltaPct>0)||(bear>bull&&deltaPct<0);
-  let tokenPrice=0.50;
-  if(correctDir){
-    if(absDelta<0.005)tokenPrice=0.50;
-    else if(absDelta<0.02)tokenPrice=0.55;
-    else if(absDelta<0.05)tokenPrice=0.65;
-    else if(absDelta<0.10)tokenPrice=0.78;
-    else tokenPrice=0.88;
-  } else {
-    if(absDelta<0.02)tokenPrice=0.50;
-    else if(absDelta<0.05)tokenPrice=0.35;
-    else tokenPrice=0.20;
-  }
-
-  const winProb=total>0?(bull>bear?bull/total:bear/total):0.5;
-  const ev=winProb*1.00-tokenPrice*1.02;
-
-  let decision='NO TRADE', reason='';
-  if(conf<0.30){decision='NO TRADE';reason='confidence too low ('+Math.round(conf*100)+'%)';}
-  else if(edge<1.2){decision='NO TRADE';reason='edge too small ('+edge.toFixed(2)+')';}
-  else if(tokenPrice>0.85){decision='NO TRADE';reason='token overpriced ¢'+Math.round(tokenPrice*100)+' — no value';}
-  else if(ev<0.01){decision='NO TRADE';reason='negative EV ('+( ev*100).toFixed(1)+'%)';}
-  else if(bull>bear){decision='BUY UP';reason='bull '+bull.toFixed(1)+' vs bear '+bear.toFixed(1)+' | EV +'+(ev*100).toFixed(1)+'% | '+timingNote;}
-  else{decision='BUY DOWN';reason='bear '+bear.toFixed(1)+' vs bull '+bull.toFixed(1)+' | EV +'+(ev*100).toFixed(1)+'% | '+timingNote;}
-
-  console.log(`[ENGINE] DECISION: ${decision} | conf:${Math.round(conf*100)}% edge:${edge.toFixed(2)} EV:${(ev*100).toFixed(1)}%`);
-
-  lockedDecision = {
-    wts: currentMarket.wts, decision, reason,
-    bull, bear, conf, quality, edge, ev, tokenPrice, winProb, deltaPct,
-    startPrice: sp, lockedAt: Date.now(), lockedAtElapsed: elapsed, resolved: false,
-    signals: { s1,s2,s3,s4,s5,s6,s7,s8,s9,s10, timing:{note:timingNote} }
-  };
-
-  broadcast({ type:'decision', decision:lockedDecision });
-
-  // Add PENDING to tracker
-  const time=new Date(currentMarket.wts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'America/New_York'});
-  trackerData.history=trackerData.history.filter(h=>h.window!==currentMarket.wts);
-  trackerData.history.push({time,decision,result:'PENDING',window:currentMarket.wts,ev:ev.toFixed(3)});
-  if(trackerData.history.length>50) trackerData.history.shift();
-  broadcast({ type:'tracker', tracker:trackerData });
-}
-
-// ── RESOLVE ───────────────────────────────────────────────────────────────────
-function resolveLastDecision(newWts) {
-  if(!lockedDecision||lockedDecision.resolved||lockedDecision.wts===newWts) return;
-  const {decision,startPrice}=lockedDecision;
-  let result='SKIP';
-  if(decision!=='NO TRADE'&&latestBTCPrice&&startPrice){
-    const won=(decision==='BUY UP'&&latestBTCPrice>=startPrice)||(decision==='BUY DOWN'&&latestBTCPrice<startPrice);
-    result=won?'WIN':'LOSS';
-    if(won)trackerData.wins++;else trackerData.losses++;
-  } else if(decision==='NO TRADE'){trackerData.skips++;result='SKIP';}
-  const idx=trackerData.history.findIndex(h=>h.window===lockedDecision.wts);
-  if(idx>=0)trackerData.history[idx].result=result;
-  lockedDecision.resolved=true;
-  console.log(`[TRACKER] ${decision} → ${result} W:${trackerData.wins} L:${trackerData.losses}`);
-  broadcast({type:'tracker',tracker:trackerData});
-}
-
-// Run engine every 15s
-setInterval(runEngine, 15000);
-
-// ── CLOB WS ───────────────────────────────────────────────────────────────────
-let clobWS=null;
+// ── CLOB WS (live odds) ───────────────────────────────────────
+let clobWS = null;
 function connectClobWS() {
-  if(clobWS){try{clobWS.terminate();}catch(e){}}
-  if(!currentMarket?.yesTokenId) return;
-  clobWS=new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
-  clobWS.on('open',()=>{
-    clobWS.send(JSON.stringify({auth:{},markets:[],assets_ids:[currentMarket.yesTokenId,currentMarket.noTokenId]}));
-    clobWS._ping=setInterval(()=>{if(clobWS.readyState===WebSocket.OPEN)clobWS.ping();},5000);
+  if (clobWS) { try { clobWS.terminate(); } catch(e) {} }
+  if (!currentMarket?.yesTokenId) return;
+  clobWS = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
+  clobWS.on('open', () => {
+    clobWS.send(JSON.stringify({ auth:{}, markets:[], assets_ids:[currentMarket.yesTokenId, currentMarket.noTokenId] }));
+    clobWS._ping = setInterval(() => { if (clobWS.readyState === WebSocket.OPEN) clobWS.ping(); }, 5000);
   });
-  clobWS.on('message',(raw)=>{
-    try{
-      const arr=[].concat(JSON.parse(raw.toString()));
-      for(const ev of arr){
-        if(ev.event_type!=='price_change'&&ev.event_type!=='last_trade_price') continue;
-        const price=parseFloat(ev.price??ev.last_trade_price);
-        if(isNaN(price)||price<=0||price>=1) continue;
-        const isYes=ev.asset_id===currentMarket.yesTokenId;
-        if(isYes){latestOdds.yes=price;latestOdds.no=parseFloat((1-price).toFixed(4));}
-        else{latestOdds.no=price;latestOdds.yes=parseFloat((1-price).toFixed(4));}
-        broadcast({type:'odds',yes:latestOdds.yes,no:latestOdds.no});
+  clobWS.on('message', (raw) => {
+    try {
+      const arr = [].concat(JSON.parse(raw.toString()));
+      for (const ev of arr) {
+        if (ev.event_type !== 'price_change' && ev.event_type !== 'last_trade_price') continue;
+        const price = parseFloat(ev.price ?? ev.last_trade_price);
+        if (isNaN(price) || price <= 0 || price >= 1) continue;
+        const isYes = ev.asset_id === currentMarket.yesTokenId;
+        if (isYes) { latestOdds.yes = price; latestOdds.no = parseFloat((1-price).toFixed(4)); }
+        else        { latestOdds.no  = price; latestOdds.yes = parseFloat((1-price).toFixed(4)); }
+        broadcast({ type: 'odds', yes: latestOdds.yes, no: latestOdds.no });
       }
-    }catch(e){}
+    } catch(e) {}
   });
-  clobWS.on('close',()=>{clearInterval(clobWS._ping);setTimeout(connectClobWS,3000);});
-  clobWS.on('error',(e)=>console.error('[CLOB]',e.message));
+  clobWS.on('close', () => { clearInterval(clobWS._ping); setTimeout(connectClobWS, 3000); });
+  clobWS.on('error', (e) => console.error('[CLOB]', e.message));
 }
 
-// ── RTDS WS ───────────────────────────────────────────────────────────────────
-let rtdsWS=null;
+// ── RTDS WS (Chainlink BTC price) ─────────────────────────────
+let rtdsWS = null;
 function connectRTDS() {
-  if(rtdsWS){try{rtdsWS.terminate();}catch(e){}}
-  rtdsWS=new WebSocket('wss://ws-live-data.polymarket.com');
-  rtdsWS.on('open',()=>{
-    rtdsWS.send(JSON.stringify({action:'subscribe',subscriptions:[{topic:'crypto_prices_chainlink',type:'*',filters:'{"symbol":"btc/usd"}'}]}));
-    rtdsWS._ping=setInterval(()=>{if(rtdsWS.readyState===WebSocket.OPEN)rtdsWS.send(JSON.stringify({action:'PING'}));},5000);
+  if (rtdsWS) { try { rtdsWS.terminate(); } catch(e) {} }
+  rtdsWS = new WebSocket('wss://ws-live-data.polymarket.com');
+  rtdsWS.on('open', () => {
+    rtdsWS.send(JSON.stringify({ action:'subscribe', subscriptions:[{ topic:'crypto_prices_chainlink', type:'*', filters:'{"symbol":"btc/usd"}' }] }));
+    rtdsWS._ping = setInterval(() => { if (rtdsWS.readyState === WebSocket.OPEN) rtdsWS.send(JSON.stringify({ action:'PING' })); }, 5000);
   });
-  rtdsWS.on('message',(raw)=>{
-    try{
-      const msg=JSON.parse(raw.toString());
-      if(msg.topic==='crypto_prices_chainlink'&&msg.payload?.value){
-        latestBTCPrice=parseFloat(msg.payload.value);
-        broadcast({type:'btc_price',price:latestBTCPrice});
+  rtdsWS.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.topic === 'crypto_prices_chainlink' && msg.payload?.value) {
+        latestBTCPrice = parseFloat(msg.payload.value);
+        lastChainlinkUpdate = Date.now();
+        const now = Date.now();
+        chainlinkBuffer.push({ ts: now, price: latestBTCPrice });
+        if (chainlinkBuffer.length > 200) chainlinkBuffer.shift();
+        broadcast({ type: 'btc_price', price: latestBTCPrice });
       }
-    }catch(e){}
+    } catch(e) {}
   });
-  rtdsWS.on('close',()=>{clearInterval(rtdsWS._ping);setTimeout(connectRTDS,3000);});
-  rtdsWS.on('error',(e)=>console.error('[RTDS]',e.message));
+  rtdsWS.on('close', () => { clearInterval(rtdsWS._ping); setTimeout(connectRTDS, 3000); });
+  rtdsWS.on('error', (e) => console.error('[RTDS]', e.message));
 }
 
-// ── MARKET ────────────────────────────────────────────────────────────────────
+// ── MARKET LOOP ───────────────────────────────────────────────
 async function fetchMarketData(slug) {
-  const r=await fetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`,{headers:{'User-Agent':'Mozilla/5.0'}});
-  const d=await r.json();
-  return Array.isArray(d)&&d.length?d[0]:null;
+  const r = await fetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const d = await r.json();
+  return Array.isArray(d) && d.length ? d[0] : null;
 }
 async function fetchInitialOdds(tokenId) {
-  try{
-    const r=await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=BUY`,{headers:{'User-Agent':'Mozilla/5.0'}});
-    const d=await r.json(); const p=parseFloat(d.price);
-    return(!isNaN(p)&&p>0&&p<1)?p:0.5;
-  }catch(e){return 0.5;}
+  try {
+    const r = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=BUY`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const d = await r.json();
+    const p = parseFloat(d.price);
+    return (!isNaN(p) && p > 0 && p < 1) ? p : 0.5;
+  } catch(e) { return 0.5; }
 }
+
 async function updateMarket() {
-  const wts=getWindowTs(0), slug=`btc-updown-5m-${wts}`;
-  if(currentMarket?.wts===wts) return;
-  console.log('[MARKET] loading',slug);
-  try{
-    const market=await fetchMarketData(slug);
-    if(!market){console.log('[MARKET] not found yet');return;}
-    const ids=JSON.parse(market.clobTokenIds||'[]');
-    const yesTokenId=ids[0], noTokenId=ids[1];
-    const endSec=wts+300;
-    resolveLastDecision(wts);
-    const startPrice=await fetchPriceToBeat(wts)||latestBTCPrice;
-    currentMarket={slug,wts,yesTokenId,noTokenId,startPrice,endSec};
-    console.log('[MARKET] loaded startPrice:',startPrice,'endSec:',endSec);
-    if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
-    broadcast({type:'market',market:currentMarket,odds:latestOdds});
+  const wts = getWindowTs(), slug = `btc-updown-5m-${wts}`;
+  if (currentMarket?.wts === wts) return;
+  console.log('[MARKET] loading', slug);
+  try {
+    const market = await fetchMarketData(slug);
+    if (!market) { console.log('[MARKET] not found yet'); return; }
+    const ids = JSON.parse(market.clobTokenIds || '[]');
+    const yesTokenId = ids[0], noTokenId = ids[1], endSec = wts + 300;
+
+    // Resolve previous window before switching
+    if (lockedDecision && !lockedDecision.resolved && lockedDecision.wts !== wts) {
+      const { decision, startPrice } = lockedDecision;
+      let result = 'SKIP';
+      if (decision !== 'NO TRADE' && latestBTCPrice && startPrice) {
+        const won = decision === 'BUY UP' ? latestBTCPrice >= startPrice : latestBTCPrice < startPrice;
+        result = won ? 'WIN' : 'LOSS';
+        if (won) trackerData.wins++; else trackerData.losses++;
+      } else if (decision === 'NO TRADE') {
+        trackerData.skips++;
+      }
+      const idx = trackerData.history.findIndex(h => h.window === lockedDecision.wts);
+      if (idx >= 0) trackerData.history[idx].result = result;
+      lockedDecision.resolved = true;
+      const won2 = decision === 'NO TRADE' ? null : (decision === 'BUY UP' ? latestBTCPrice >= startPrice : latestBTCPrice < startPrice);
+      resolvePaperTrade(lockedDecision.wts, won2);
+      console.log('[TRACKER]', decision, '→', result, `W:${trackerData.wins} L:${trackerData.losses}`);
+      broadcast({ type: 'tracker', tracker: trackerData });
+    }
+
+    lockedDecision = null;
+
+    // Price to beat = Chainlink price at exact window open time
+    const startPrice = getPriceAtTime(wts * 1000) || latestBTCPrice;
+    currentMarket = { slug, wts, yesTokenId, noTokenId, startPrice, endSec };
+    console.log('[MARKET] startPrice:', startPrice, '(Chainlink at window open)');
+
+    if (yesTokenId) {
+      const yp = await fetchInitialOdds(yesTokenId);
+      latestOdds = { yes: yp, no: parseFloat((1-yp).toFixed(4)) };
+    }
+    broadcast({ type: 'market', market: currentMarket, odds: latestOdds });
     connectClobWS();
-    // Fire engine immediately after new market loads
-    setTimeout(runEngine, 3000);
-  }catch(e){console.error('[MARKET]',e.message);}
+    setTimeout(() => runEngine(), 3000);
+  } catch(e) { console.error('[MARKET]', e.message); }
 }
-setInterval(updateMarket,15000);
+setInterval(updateMarket, 15000);
 updateMarket();
 
-// ── BROWSER WS ────────────────────────────────────────────────────────────────
-wss.on('connection',(ws)=>{
+// ── ENGINE ────────────────────────────────────────────────────
+// Track Chainlink update frequency
+let lastChainlinkUpdate = Date.now();
+// (already set in RTDS handler — we'll update it there too)
+
+async function fetchCandles() {
+  const sources = [
+    'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',
+    'https://api.binance.us/api/v3/klines?symbol=BTCUSD&interval=1m&limit=30',
+    'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=30',
+  ];
+  for (const url of sources) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!Array.isArray(data) || !data.length) throw new Error('empty');
+      return data.map(c => ({ open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5] }));
+    } catch(e) { console.warn('[CANDLES] failed:', url, e.message); }
+  }
+  console.error('[CANDLES] all sources failed');
+  return null;
+}
+function ema(v, p) { const k=2/(p+1); let e=v[0]; for(let i=1;i<v.length;i++) e=v[i]*k+e*(1-k); return e; }
+function rsi(c, p=14) { if(c.length<p+1) return 50; let g=0,l=0; for(let i=c.length-p;i<c.length;i++){const d=c[i]-c[i-1];d>0?g+=d:l-=d;} const ag=g/p,al=l/p; if(!al) return 100; return 100-(100/(1+ag/al)); }
+function avg(a) { return a.reduce((s,x)=>s+x,0)/a.length; }
+
+async function runEngine() {
+  if (!currentMarket || !latestBTCPrice || !currentMarket.startPrice) return;
+  const secsLeft = Math.max(0, currentMarket.endSec - Math.floor(Date.now()/1000));
+  if (secsLeft <= 0) return;
+  const elapsed = 300 - secsLeft;
+
+  // Wait 60s minimum
+  if (elapsed < 60) { broadcast({ type: 'engine_waiting', elapsed }); return; }
+  // Already locked — re-broadcast
+  if (lockedDecision && lockedDecision.wts === currentMarket.wts && !lockedDecision.resolved) {
+    broadcast({ type: 'decision', decision: lockedDecision }); return;
+  }
+
+  const cp = latestBTCPrice, sp = currentMarket.startPrice;
+  const yp = latestOdds.yes, np = latestOdds.no;
+  const delta = ((cp - sp) / sp) * 100;
+  const absDelta = Math.abs(delta);
+
+  // Fetch candles for technical signals
+  const candles = await fetchCandles();
+
+  let bull = 0, bear = 0;
+  let signals = [];
+
+  // ── SIGNAL 1: Window Delta (weight 8) ─────────────────────
+  if      (delta >  0.10) { bull += 8;   signals.push('delta strongly UP'); }
+  else if (delta >  0.05) { bull += 6.4; signals.push('delta UP'); }
+  else if (delta >  0.02) { bull += 4.8; signals.push('delta slightly UP'); }
+  else if (delta >  0.005){ bull += 2.4; signals.push('delta barely UP'); }
+  else if (delta < -0.10) { bear += 8;   signals.push('delta strongly DOWN'); }
+  else if (delta < -0.05) { bear += 6.4; signals.push('delta DOWN'); }
+  else if (delta < -0.02) { bear += 4.8; signals.push('delta slightly DOWN'); }
+  else if (delta < -0.005){ bear += 2.4; signals.push('delta barely DOWN'); }
+
+  // ── SIGNAL 2: Market Odds (weight 2) ──────────────────────
+  if      (yp > 0.70) { bull += 2;   signals.push(`YES bid ${Math.round(yp*100)}¢`); }
+  else if (yp > 0.55) { bull += 1.2; signals.push(`YES lean ${Math.round(yp*100)}¢`); }
+  else if (np > 0.70) { bear += 2;   signals.push(`NO bid ${Math.round(np*100)}¢`); }
+  else if (np > 0.55) { bear += 1.2; signals.push(`NO lean ${Math.round(np*100)}¢`); }
+
+  // ── CANDLE SIGNALS ─────────────────────────────────────────
+  let confMod = 0;
+  if (candles && candles.length >= 5) {
+    // SIGNAL 3: 1m Momentum (weight 2.5)
+    if (candles.length >= 3) {
+      const m1 = candles[candles.length-1].close - candles[candles.length-1].open;
+      const m2 = candles[candles.length-2].close - candles[candles.length-2].open;
+      if (m1>0 && m2>0) { bull += 2.5; signals.push('2 bull candles'); }
+      else if (m1<0 && m2<0) { bear += 2.5; signals.push('2 bear candles'); }
+      else if (m1>0) { bull += 1.25; signals.push('last candle bullish'); }
+      else if (m1<0) { bear += 1.25; signals.push('last candle bearish'); }
+    }
+    // SIGNAL 4: 3m Trend (weight 2)
+    if (candles.length >= 4) {
+      const sl = candles.slice(-3);
+      const bc = sl.filter(c=>c.close>c.open).length, rc = sl.filter(c=>c.close<c.open).length;
+      if (bc===3) { bull += 2; signals.push('3/3 bull candles'); }
+      else if (rc===3) { bear += 2; signals.push('3/3 bear candles'); }
+      else if (bc===2) { bull += 1; signals.push('2/3 bull'); }
+      else if (rc===2) { bear += 1; signals.push('2/3 bear'); }
+    }
+    // SIGNAL 5: EMA 9/21 (weight 1)
+    if (candles.length >= 22) {
+      const cl = candles.map(c=>c.close);
+      const e9 = ema(cl.slice(-9),9), e21 = ema(cl.slice(-21),21);
+      const g = ((e9-e21)/e21)*100;
+      if (g > 0.02) { bull += 1; signals.push(`EMA9>EMA21 +${g.toFixed(3)}%`); }
+      else if (g < -0.02) { bear += 1; signals.push(`EMA9<EMA21 ${g.toFixed(3)}%`); }
+    }
+    // SIGNAL 6: RSI (weight 1.5)
+    if (candles.length >= 16) {
+      const r = rsi(candles.map(c=>c.close), 14);
+      if (r < 25) { bull += 1.5; signals.push(`RSI oversold ${r.toFixed(0)}`); }
+      else if (r < 35) { bull += 0.75; signals.push(`RSI low ${r.toFixed(0)}`); }
+      else if (r > 75) { bear += 1.5; signals.push(`RSI overbought ${r.toFixed(0)}`); }
+      else if (r > 65) { bear += 0.75; signals.push(`RSI high ${r.toFixed(0)}`); }
+    }
+    // SIGNAL 7: Volume spike (confidence modifier)
+    if (candles.length >= 7) {
+      const recentVol = avg(candles.slice(-3).map(c=>c.volume));
+      const priorVol  = avg(candles.slice(-6,-3).map(c=>c.volume));
+      const ratio = recentVol / priorVol;
+      if (ratio > 1.5) { confMod += 0.10; signals.push(`vol surge ${ratio.toFixed(1)}x`); }
+      else if (ratio > 1.2) { confMod += 0.05; signals.push('vol elevated'); }
+      else if (ratio < 0.6) { confMod -= 0.08; signals.push('vol dry'); }
+    }
+    // SIGNAL 8: Wick rejection (weight 1.5)
+    if (candles.length >= 2) {
+      const l = candles[candles.length-1];
+      const body = Math.abs(l.close-l.open), range = l.high-l.low;
+      if (range > 0) {
+        const uw = (l.high - Math.max(l.open,l.close)) / range;
+        const lw = (Math.min(l.open,l.close) - l.low) / range;
+        if (uw > 0.5 && body/range < 0.3) { bear += 1.5; signals.push(`bear wick ${Math.round(uw*100)}%`); }
+        else if (lw > 0.5 && body/range < 0.3) { bull += 1.5; signals.push(`bull wick ${Math.round(lw*100)}%`); }
+      }
+    }
+    // SIGNAL 9: Choppiness penalty
+    let dirChanges = 0;
+    const sl5 = candles.slice(-5);
+    for (let i=1;i<sl5.length;i++) {
+      const p=sl5[i-1].close-sl5[i-1].open, q=sl5[i].close-sl5[i].open;
+      if ((p>0&&q<0)||(p<0&&q>0)) dirChanges++;
+    }
+    if (dirChanges >= 3) { confMod -= 0.12; signals.push(`choppy ${dirChanges}/4`); }
+  } else {
+    signals.push('no candles — delta+odds only');
+  }
+
+  // ── SIGNAL 10: Chainlink update frequency ─────────────────
+  const chainlinkAge = (Date.now() - lastChainlinkUpdate) / 1000;
+  if (chainlinkAge > 25) {
+    confMod -= 0.15;
+    signals.push(`Chainlink stale ${chainlinkAge.toFixed(0)}s — low vol`);
+  } else if (chainlinkAge > 12) {
+    confMod -= 0.07;
+    signals.push(`Chainlink slow ${chainlinkAge.toFixed(0)}s`);
+  }
+
+  // ── CONFIDENCE ─────────────────────────────────────────────
+  let conf;
+  if      (absDelta > 0.10) conf = 0.90;
+  else if (absDelta > 0.05) conf = 0.75;
+  else if (absDelta > 0.02) conf = 0.58;
+  else if (absDelta > 0.005) conf = 0.40;
+  else                       conf = 0.15;
+
+  // Candle agreement boosts/reduces confidence
+  const total = bull + bear;
+  const signalAlignment = total > 0 ? (bull > bear ? bull/total : bear/total) : 0.5;
+  conf = conf * 0.6 + signalAlignment * 0.4;
+
+  // Apply modifiers
+  conf = Math.max(0, Math.min(1, conf + confMod));
+
+  // Odds aligned = small boost
+  const oddsAligned = (bull > bear && yp > 0.55) || (bear > bull && np > 0.55);
+  if (oddsAligned) conf = Math.min(1, conf + 0.05);
+  if (elapsed > 200) conf = Math.min(1, conf + 0.04);
+
+  const quality = Math.max(0, Math.min(1, conf * 0.75 + (Math.min(elapsed,240)/240) * 0.25));
+  const edge = Math.abs(bull - bear);
+
+  // ── DECISION ───────────────────────────────────────────────
+  let decision = 'NO TRADE', reason = '';
+  if (absDelta < 0.002) {
+    decision = 'NO TRADE';
+    reason = `delta flat (${delta.toFixed(4)}%)`;
+  } else if (bull > bear) {
+    decision = 'BUY UP';
+    reason = signals.slice(0,3).join(' · ');
+  } else {
+    decision = 'BUY DOWN';
+    reason = signals.slice(0,3).join(' · ');
+  }
+
+  console.log('[ENGINE]', decision, `conf:${Math.round(conf*100)}% quality:${Math.round(quality*100)}% delta:${delta.toFixed(3)}% elapsed:${elapsed}s | ${signals.join(', ')}`);
+
+  lockedDecision = { wts: currentMarket.wts, decision, reason, bull, bear, conf, quality, edge, startPrice: sp, lockedAt: Date.now(), lockedAtElapsed: elapsed, resolved: false };
+  broadcast({ type: 'decision', decision: lockedDecision });
+  // Auto paper trade
+  paperTrade(decision, latestOdds);
+
+  const time = new Date(currentMarket.wts * 1000).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York' });
+  trackerData.history = trackerData.history.filter(h => h.window !== currentMarket.wts);
+  trackerData.history.push({ time, decision, result: 'PENDING', window: currentMarket.wts, conf: Math.round(conf*100) });
+  if (trackerData.history.length > 20) trackerData.history.shift();
+  broadcast({ type: 'tracker', tracker: trackerData });
+}
+
+// Run engine every 10s
+setInterval(async () => {
+  if (!lockedDecision || lockedDecision.wts !== getWindowTs()) await runEngine();
+  else broadcast({ type: 'decision', decision: lockedDecision });
+}, 10000);
+
+// ── BROWSER WS ────────────────────────────────────────────────
+wss.on('connection', (ws) => {
   clients.add(ws);
-  console.log('[WS] client connected, total:',clients.size);
-  if(currentMarket)  ws.send(JSON.stringify({type:'market',market:currentMarket,odds:latestOdds}));
-  if(latestBTCPrice) ws.send(JSON.stringify({type:'btc_price',price:latestBTCPrice}));
-  if(lockedDecision&&!lockedDecision.resolved) ws.send(JSON.stringify({type:'decision',decision:lockedDecision}));
-  ws.send(JSON.stringify({type:'tracker',tracker:trackerData}));
-  ws.on('close',()=>clients.delete(ws));
-  ws.on('error',()=>clients.delete(ws));
+  console.log('[WS] client connected, total:', clients.size);
+  if (currentMarket)  ws.send(JSON.stringify({ type: 'market', market: currentMarket, odds: latestOdds }));
+  if (latestBTCPrice) ws.send(JSON.stringify({ type: 'btc_price', price: latestBTCPrice }));
+  if (lockedDecision && !lockedDecision.resolved) ws.send(JSON.stringify({ type: 'decision', decision: lockedDecision }));
+  ws.send(JSON.stringify({ type: 'tracker', tracker: trackerData }));
+  ws.on('close', () => clients.delete(ws));
+  ws.on('error', () => clients.delete(ws));
 });
 
-// ── REST ──────────────────────────────────────────────────────────────────────
-app.get('/health',(req,res)=>res.json({ok:true,market:currentMarket?.slug,btc:latestBTCPrice,locked:lockedDecision?.decision||null}));
-app.get('/tracker',(req,res)=>res.json(trackerData));
-app.post('/tracker',(req,res)=>{
-  const{wins,losses,skips,history}=req.body;
-  if(typeof wins==='number')trackerData.wins=wins;
-  if(typeof losses==='number')trackerData.losses=losses;
-  if(typeof skips==='number')trackerData.skips=skips;
-  if(Array.isArray(history))trackerData.history=history.slice(-50);
-  res.json({ok:true});
+// ── PAPER TRADING ─────────────────────────────────────────────
+const ADMIN_PASSWORD = '5588';
+const PAPER_START = 100;
+let paperData = {
+  balance: 100,
+  startBalance: 100,
+  betSize: 10,
+  trades: [],
+  totalInvested: 0,
+  totalReturned: 0,
+};
+// Auto paper trade when decision locks
+function paperTrade(decision, odds) {
+  if (!decision || decision === 'NO TRADE' || !odds) return;
+  const betSize = paperData.betSize;
+  if (paperData.balance < betSize) return;
+  const isUp = decision === 'BUY UP';
+  const tokenPrice = isUp ? odds.yes : odds.no;
+  if (!tokenPrice || tokenPrice <= 0) return;
+  const shares = betSize / tokenPrice;
+  const potentialPayout = shares * 1.0;
+  paperData.balance -= betSize;
+  paperData.totalInvested += betSize;
+  const trade = {
+    id: Date.now(),
+    time: new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York'}),
+    wts: currentMarket?.wts,
+    decision,
+    betSize,
+    tokenPrice: parseFloat(tokenPrice.toFixed(4)),
+    shares: parseFloat(shares.toFixed(4)),
+    potentialPayout: parseFloat(potentialPayout.toFixed(2)),
+    result: 'PENDING',
+    pnl: 0,
+  };
+  paperData.trades.unshift(trade);
+  if (paperData.trades.length > 50) paperData.trades.pop();
+  console.log(`[PAPER] ${decision} $${betSize} @ ¢${Math.round(tokenPrice*100)} = ${shares.toFixed(2)} shares`);
+}
+// Resolve paper trade when window closes
+function resolvePaperTrade(wts, won) {
+  const trade = paperData.trades.find(t => t.wts === wts && t.result === 'PENDING');
+  if (!trade) return;
+  if (won === null) { trade.result = 'SKIP'; return; }
+  if (won) {
+    trade.result = 'WIN';
+    trade.pnl = parseFloat((trade.potentialPayout - trade.betSize).toFixed(2));
+    paperData.balance += trade.potentialPayout;
+    paperData.totalReturned += trade.potentialPayout;
+  } else {
+    trade.result = 'LOSS';
+    trade.pnl = -trade.betSize;
+  }
+  console.log(`[PAPER] resolved ${trade.decision} → ${trade.result} pnl:$${trade.pnl} balance:$${paperData.balance.toFixed(2)}`);
+}
+
+// ── REST ──────────────────────────────────────────────────────
+app.get('/candles', async (req, res) => {
+  try {
+    const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30', { signal: AbortSignal.timeout(6000) });
+    res.json(await r.json());
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/tracker', (req, res) => res.json(trackerData));
+app.get('/health',  (req, res) => res.json({ ok: true, market: currentMarket?.slug, btc: latestBTCPrice, decision: lockedDecision?.decision || null }));
+
+// Admin auth
+app.post('/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASSWORD) res.json({ ok: true, token: Buffer.from(ADMIN_PASSWORD).toString('base64') });
+  else res.status(401).json({ ok: false, error: 'Wrong password' });
+});
+
+function adminAuth(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (token === Buffer.from(ADMIN_PASSWORD).toString('base64')) return next();
+  res.status(401).json({ ok: false, error: 'Unauthorized' });
+}
+
+// Admin endpoints
+app.get('/admin/stats', adminAuth, (req, res) => {
+  const w = trackerData.wins, l = trackerData.losses, t = w + l;
+  const roi = ((paperData.balance - paperData.startBalance) / paperData.startBalance * 100).toFixed(2);
+  res.json({
+    liveUsers: clients.size,
+    signal: { wins: w, losses: l, skips: trackerData.skips, winRate: t > 0 ? Math.round(w/t*100) : 0 },
+    market: currentMarket ? { slug: currentMarket.slug, startPrice: currentMarket.startPrice, endSec: currentMarket.endSec } : null,
+    btcPrice: latestBTCPrice,
+    odds: latestOdds,
+    decision: lockedDecision,
+    paper: { ...paperData, roi: parseFloat(roi) },
+  });
+});
+
+app.post('/admin/paper/reset', adminAuth, (req, res) => {
+  const { startBalance, betSize } = req.body;
+  paperData = { balance: startBalance||100, startBalance: startBalance||100, betSize: betSize||10, trades: [], totalInvested: 0, totalReturned: 0 };
+  res.json({ ok: true });
+});
+
+app.post('/admin/paper/betsize', adminAuth, (req, res) => {
+  paperData.betSize = Math.max(1, Math.min(paperData.balance, req.body.betSize || 10));
+  res.json({ ok: true, betSize: paperData.betSize });
 });
 
 connectRTDS();
-const PORT=process.env.PORT||3001;
-server.listen(PORT,()=>console.log(`[SERVER] port ${PORT}`));
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => console.log(`[SERVER] port ${PORT}`));
