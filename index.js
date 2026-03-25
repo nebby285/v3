@@ -118,18 +118,21 @@ async function updateMarket() {
     // Resolve previous window before switching
     if (lockedDecision && !lockedDecision.resolved && lockedDecision.wts !== wts) {
       const { decision, startPrice } = lockedDecision;
+      // Use price at end of OLD window (= start of new window) from Chainlink buffer
+      const closingPrice = getPriceAtTime(wts * 1000) || latestBTCPrice;
       let result = 'SKIP';
-      if (decision !== 'NO TRADE' && latestBTCPrice && startPrice) {
-        const won = decision === 'BUY UP' ? latestBTCPrice >= startPrice : latestBTCPrice < startPrice;
+      if (decision !== 'NO TRADE' && closingPrice && startPrice) {
+        const won = decision === 'BUY UP' ? closingPrice >= startPrice : closingPrice < startPrice;
         result = won ? 'WIN' : 'LOSS';
         if (won) trackerData.wins++; else trackerData.losses++;
+        console.log('[RESOLVE] decision:', decision, 'startPrice:', startPrice, 'closingPrice:', closingPrice, '→', result);
       } else if (decision === 'NO TRADE') {
         trackerData.skips++;
       }
       const idx = trackerData.history.findIndex(h => h.window === lockedDecision.wts);
       if (idx >= 0) trackerData.history[idx].result = result;
       lockedDecision.resolved = true;
-      const won2 = decision === 'NO TRADE' ? null : (decision === 'BUY UP' ? latestBTCPrice >= startPrice : latestBTCPrice < startPrice);
+      const won2 = decision === 'NO TRADE' ? null : (decision === 'BUY UP' ? closingPrice >= startPrice : closingPrice < startPrice);
       resolvePaperTrade(lockedDecision.wts, won2);
       console.log('[TRACKER]', decision, '→', result, `W:${trackerData.wins} L:${trackerData.losses}`);
       broadcast({ type: 'tracker', tracker: trackerData });
