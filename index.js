@@ -247,7 +247,14 @@ function calculateEV(winProb, tokenCost, fee=0.02) {
 
 // ── MAIN ENGINE ───────────────────────────────────────────────
 async function runEngine() {
-  if(!currentMarket || !latestBTCPrice || !currentMarket.startPrice) return;
+  if(!currentMarket || !latestBTCPrice) return;
+  // If startPrice missing, try to get it now
+  if(!currentMarket.startPrice) {
+    const sp = await fetchPriceToBeat(currentMarket.wts) || latestBTCPrice;
+    currentMarket.startPrice = sp;
+    console.log('[ENGINE] late startPrice fetch:', sp);
+  }
+  if(!currentMarket.startPrice) return;
   const nowSec = Math.floor(Date.now() / 1000);
   const secsLeft = Math.max(0, currentMarket.endSec - nowSec);
   if(secsLeft <= 0) return;
@@ -439,6 +446,8 @@ async function updateMarket() {
     if(yesTokenId){const yp=await fetchInitialOdds(yesTokenId);latestOdds={yes:yp,no:parseFloat((1-yp).toFixed(4))};}
     broadcast({type:'market',market:currentMarket,odds:latestOdds});
     connectClobWS();
+    // Fire engine soon after market loads in case we're mid-window
+    setTimeout(runEngine, 3000);
   }catch(e){console.error('[MARKET]',e.message);}
 }
 setInterval(updateMarket,15000);
