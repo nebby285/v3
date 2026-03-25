@@ -326,20 +326,46 @@ async function runEngine() {
   const quality = Math.max(0, Math.min(1, conf * 0.75 + (Math.min(elapsed,240)/240) * 0.25));
   const edge = Math.abs(bull - bear);
 
+  // ── TOKEN PRICE & EV ESTIMATE ──────────────────────────────
+  const correctDir = (bull > bear && delta > 0) || (bear > bull && delta < 0);
+  let tokenPrice = 0.50;
+  if (correctDir) {
+    if      (absDelta < 0.005) tokenPrice = 0.50;
+    else if (absDelta < 0.02)  tokenPrice = 0.55;
+    else if (absDelta < 0.05)  tokenPrice = 0.65;
+    else if (absDelta < 0.10)  tokenPrice = 0.78;
+    else                       tokenPrice = 0.88;
+  } else {
+    if      (absDelta < 0.02)  tokenPrice = 0.50;
+    else if (absDelta < 0.05)  tokenPrice = 0.35;
+    else                       tokenPrice = 0.20;
+  }
+  const winProb = total > 0 ? (bull > bear ? bull/total : bear/total) : 0.5;
+  const ev = winProb * 1.00 - tokenPrice * 1.02;
+
   // ── DECISION ───────────────────────────────────────────────
   let decision = 'NO TRADE', reason = '';
   if (absDelta < 0.002) {
     decision = 'NO TRADE';
     reason = `delta flat (${delta.toFixed(4)}%)`;
-  } else if (conf < 0.55) {
+  } else if (conf < 0.28) {
     decision = 'NO TRADE';
-    reason = `confidence too low (${Math.round(conf*100)}%) — skipping`;
+    reason = `confidence too low (${Math.round(conf*100)}%)`;
+  } else if (edge < 1.0) {
+    decision = 'NO TRADE';
+    reason = `edge too small (${edge.toFixed(1)})`;
+  } else if (tokenPrice > 0.87) {
+    decision = 'NO TRADE';
+    reason = `token overpriced ¢${Math.round(tokenPrice*100)} — no value`;
+  } else if (ev < 0) {
+    decision = 'NO TRADE';
+    reason = `negative EV (${(ev*100).toFixed(1)}%)`;
   } else if (bull > bear) {
     decision = 'BUY UP';
-    reason = signals.slice(0,3).join(' · ');
+    reason = signals.slice(0,3).join(' · ') + ` | EV +${(ev*100).toFixed(1)}%`;
   } else {
     decision = 'BUY DOWN';
-    reason = signals.slice(0,3).join(' · ');
+    reason = signals.slice(0,3).join(' · ') + ` | EV +${(ev*100).toFixed(1)}%`;
   }
 
   console.log('[ENGINE]', decision, `conf:${Math.round(conf*100)}% quality:${Math.round(quality*100)}% delta:${delta.toFixed(3)}% elapsed:${elapsed}s | ${signals.join(', ')}`);
@@ -396,7 +422,7 @@ wss.on('connection', async (ws, req) => {
 });
 
 // ── PAPER TRADING ─────────────────────────────────────────────
-const ADMIN_PASSWORD = '5588';
+const ADMIN_PASSWORD = '5656';
 const PAPER_START = 100;
 let paperData = {
   balance: 100,
