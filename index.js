@@ -259,7 +259,10 @@ async function runEngine() {
   const secsLeft = Math.max(0, currentMarket.endSec - nowSec);
   if(secsLeft <= 0) return;
   const elapsed = 300 - secsLeft;
-  if(elapsed < 60) return;
+  if(elapsed < 60) {
+    broadcast({ type:'engine_waiting', elapsed, secsUntilFire: 60 - elapsed });
+    return;
+  }
   if(lockedDecision && lockedDecision.wts === currentMarket.wts && !lockedDecision.resolved) {
     broadcast({ type:'decision', decision:lockedDecision });
     return;
